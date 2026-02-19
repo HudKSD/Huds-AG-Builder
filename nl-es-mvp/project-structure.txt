@@ -1,0 +1,25 @@
+nl-es-mvp/
+├─ app/
+│  ├─ __init__.py
+│  ├─ main.py
+│  ├─ config.py
+│  ├─ llm_client.py
+│  ├─ agent.py
+│  ├─ conversation_store.py
+│  ├─ schema_cache.py
+│  ├─ tools/
+│  │  ├─ __init__.py
+│  │  ├─ base.py
+│  │  ├─ registry.py
+│  │  └─ es_tools.py
+│  ├─ templates/
+│  │  └─ index.html
+│  └─ static/
+│     ├─ app.js
+│     └─ styles.css
+├─ requirements.txt
+├─ Dockerfile
+├─ docker-compose.yml
+├─ .env.example
+└─ README.md
+
