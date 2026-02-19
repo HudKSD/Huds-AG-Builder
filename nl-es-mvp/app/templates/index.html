@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>RabitaNoor | NL → Elasticsearch Console</title>
+
+  <!-- Keep your existing main stylesheet -->
+  <link rel="stylesheet" href="/static/styles.css"/>
+
+  <!-- Inline UI safety + Markdown styling (so you don't need to edit styles.css) -->
+  <style>
+    /* Ensure nothing "leaks" visible at boot */
+    .hidden { display: none !important; }
+
+    /* ChatGPT-like formatting inside message bubbles */
+    .msg .content.md { white-space: normal; line-height: 1.45; }
+    .msg .content.md p { margin: 8px 0; }
+    .msg .content.md p:first-child { margin-top: 0; }
+    .msg .content.md p:last-child { margin-bottom: 0; }
+
+    .msg .content.md h1,
+    .msg .content.md h2,
+    .msg .content.md h3 { margin: 10px 0 8px 0; line-height: 1.2; }
+    .msg .content.md h1 { font-size: 16px; }
+    .msg .content.md h2 { font-size: 15px; }
+    .msg .content.md h3 { font-size: 14px; color: rgba(255,255,255,.88); }
+
+    .msg .content.md ul,
+    .msg .content.md ol { margin: 8px 0 8px 22px; padding: 0; }
+    .msg .content.md li { margin: 5px 0; }
+
+    .msg .content.md blockquote{
+      margin: 10px 0;
+      padding: 10px 12px;
+      border-left: 3px solid rgba(91,226,255,.35);
+      background: rgba(0,0,0,.16);
+      border-radius: 12px;
+      color: rgba(255,255,255,.85);
+    }
+
+    .msg .content.md a{
+      color: #5BE2FF;
+      text-decoration: none;
+      border-bottom: 1px dashed rgba(91,226,255,.35);
+    }
+    .msg .content.md a:hover{ filter: brightness(1.15); }
+
+    .msg .content.md code.inline{
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 12px;
+      padding: 2px 6px;
+      border-radius: 8px;
+      border: 1px solid rgba(255,255,255,.10);
+      background: rgba(0,0,0,.18);
+    }
+
+    .codeblock{
+      margin: 10px 0;
+      border: 1px solid rgba(255,255,255,.10);
+      border-radius: 14px;
+      overflow: hidden;
+      background: rgba(0,0,0,.18);
+    }
+    .codeblock-head{
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap:10px;
+      padding: 10px 12px;
+      border-bottom: 1px solid rgba(255,255,255,.08);
+      background: rgba(0,0,0,.22);
+      font-size: 12px;
+      color: rgba(255,255,255,.75);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
+    .codeblock-head .lang{ opacity:.9; }
+    .codeblock-head button{
+      cursor:pointer;
+      padding: 6px 10px;
+      border-radius: 10px;
+      border: 1px solid rgba(91,226,255,.25);
+      background: rgba(0,0,0,.18);
+      color: rgba(255,255,255,.90);
+      font-weight: 700;
+    }
+    .codeblock-head button:hover{ filter: brightness(1.12); }
+
+    .msg .content.md pre{
+      margin: 0;
+      padding: 12px;
+      overflow:auto;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 12px;
+      line-height: 1.35;
+    }
+    .msg .content.md pre code{
+      display:block;
+      white-space: pre;
+    }
+  </style>
+
+  <!-- Inline favicon (no 404s) -->
+  <link rel="icon"
+        href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='128'%20height='128'%3E%3Cdefs%3E%3ClinearGradient%20id='g'%20x1='0'%20y1='0'%20x2='1'%20y2='1'%3E%3Cstop%20offset='0'%20stop-color='%235BE2FF'/%3E%3Cstop%20offset='1'%20stop-color='%237C4DFF'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect%20width='128'%20height='128'%20rx='28'%20fill='%23071225'/%3E%3Crect%20x='10'%20y='10'%20width='108'%20height='108'%20rx='24'%20fill='url(%23g)'%20opacity='0.25'/%3E%3Ctext%20x='64'%20y='78'%20font-size='56'%20text-anchor='middle'%20font-family='ui-monospace, Menlo, Consolas'%20fill='%23EAF2FF'%3ERN%3C/text%3E%3C/svg%3E">
+</head>
+
+<body>
+  <div class="bg-grid"></div>
+  <div class="scanlines"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">RN</div>
+      <div class="brand-text">
+        <div class="title">RabitaNoor — Threat Console</div>
+        <div class="subtitle">Natural Language ↔ Elasticsearch (Schema-first + Fallback ladder)</div>
+      </div>
+    </div>
+
+    <div class="top-actions">
+      <div class="pill" id="pillEs">
+        <span class="dot" id="dotEs"></span>
+        <span id="esLabel">ES: checking…</span>
+      </div>
+      <button class="btn btn-ghost" id="btnClearUI" title="Clear UI (keeps conversation id)">Clear UI</button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <section class="card">
+        <h3>Conversation</h3>
+        <div class="kv">
+          <div class="k">ID</div>
+          <div class="v mono" id="convId">—</div>
+        </div>
+        <div class="row gap">
+          <button class="btn btn-small" id="btnCopyConv">Copy</button>
+          <button class="btn btn-small btn-warn" id="btnResetConv">Reset</button>
+        </div>
+        <p class="hint">Reset creates a new conversation ID.</p>
+      </section>
+
+      <section class="card">
+        <h3>Index scope</h3>
+        <div class="chips">
+          {% for p in allowed_patterns %}
+            <span class="chip mono">{{ p }}</span>
+          {% endfor %}
+        </div>
+        <p class="hint">Agent is constrained to these patterns only.</p>
+      </section>
+
+      <section class="card">
+        <h3>Quick prompts</h3>
+        <div class="quick">
+          <button class="qbtn" data-q='Find CVE-2026-1358 in cached data last 30 days'>Find CVE (30d)</button>
+          <button class="qbtn" data-q='Find "CVE-2026-1358" (no time filter if none)'>Find CVE (fallback)</button>
+          <button class="qbtn" data-q='Top CVEs mentioned in the last 7 days'>Top CVEs (7d)</button>
+          <button class="qbtn" data-q='Show latest 10 cached documents'>Latest docs</button>
+          <button class="qbtn" data-q='Search for "ransomware" in the last 30 days'>Keyword (30d)</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h3>Tips</h3>
+        <ul class="bullets">
+          <li>Use explicit time: “last 7 days”, “past 6 hours”.</li>
+          <li>Indicators: CVE / IP / hash / domain.</li>
+          <li>Click a hit to view full JSON.</li>
+        </ul>
+      </section>
+    </aside>
+
+    <!-- Main -->
+    <main class="main">
+      <section class="card chat">
+        <div class="chat-head">
+          <div>
+            <div class="h1">Mission Console</div>
+            <div class="hint">Enter to send. Shift+Enter for newline.</div>
+          </div>
+
+          <div class="row gap">
+            <button class="btn btn-ghost" id="btnCopyLastQuery" title="Copy last query JSON">Copy Query</button>
+            <button class="btn btn-ghost" id="btnCopyLastRaw" title="Copy last raw response JSON">Copy Raw</button>
+          </div>
+        </div>
+
+        <div id="messages" class="messages"></div>
+
+        <div class="composer">
+          <textarea id="input" rows="2"
+            placeholder="Ask in natural language… e.g. Find CVE-2026-1358 in the last 30 days"></textarea>
+          <button class="btn" id="send">
+            <span id="sendLabel">Send</span>
+            <span class="spinner hidden" id="spinner"></span>
+          </button>
+        </div>
+        <div class="composer-foot">
+          <span class="mono" id="reqMeta">—</span>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="tabs">
+          <button class="tab active" data-tab="overview">Overview</button>
+          <button class="tab" data-tab="query">Query</button>
+          <button class="tab" data-tab="hits">Hits</button>
+          <button class="tab" data-tab="trace">Trace</button>
+          <button class="tab" data-tab="raw">Raw</button>
+        </div>
+
+        <div class="tabpanes">
+          <div class="pane active" id="pane-overview">
+            <div class="grid2">
+              <div class="mini">
+                <div class="k">Stage</div>
+                <div class="v mono" id="ovStage">—</div>
+              </div>
+              <div class="mini">
+                <div class="k">Index</div>
+                <div class="v mono" id="ovIndex">—</div>
+              </div>
+              <div class="mini">
+                <div class="k">Count</div>
+                <div class="v mono" id="ovCount">—</div>
+              </div>
+              <div class="mini">
+                <div class="k">Time field</div>
+                <div class="v mono" id="ovTimeField">—</div>
+              </div>
+            </div>
+
+            <div class="row gap mt">
+              <input id="hitsFilter" class="filter" placeholder="Filter hits (client-side)…"/>
+              <button class="btn btn-small" id="btnExportHits">Export hits JSON</button>
+            </div>
+
+            <div class="hint mt">
+              If count is 0, the agent escalates: structured → multi_match → simple_query_string(*) → optional no-time fallback.
+            </div>
+          </div>
+
+          <div class="pane" id="pane-query">
+            <div class="row gap mb">
+              <button class="btn btn-small" id="btnCopyQuery">Copy</button>
+              <button class="btn btn-small btn-ghost" id="btnPrettyQuery">Pretty</button>
+            </div>
+            <pre id="queryUsed" class="code"></pre>
+          </div>
+
+          <div class="pane" id="pane-hits">
+            <div id="hitsWrap" class="hits"></div>
+          </div>
+
+          <div class="pane" id="pane-trace">
+            <pre id="traceBox" class="code"></pre>
+          </div>
+
+          <div class="pane" id="pane-raw">
+            <pre id="rawBox" class="code"></pre>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Modal: MUST start hidden -->
+  <div class="modal hidden" id="modal" aria-hidden="true">
+    <div class="modal-backdrop" id="modalBackdrop"></div>
+    <div class="modal-card">
+      <div class="modal-head">
+        <div class="mono" id="modalTitle">Hit</div>
+        <div class="row gap">
+          <button class="btn btn-small" id="btnCopyModal">Copy</button>
+          <button class="btn btn-small btn-warn" id="btnCloseModal">Close</button>
+        </div>
+      </div>
+      <pre class="code modal-body" id="modalBody"></pre>
+    </div>
+  </div>
+
+  <div class="toast hidden" id="toast"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
+
