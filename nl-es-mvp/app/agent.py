@@ -26,9 +26,12 @@ Rules:
   - match/match_phrase on text fields
   - for aggregations, prefer '.keyword' when present
 - Always apply a time window if possible, but if no results: use fallback ladder.
-- When done, answer with:
-  1) 2–8 bullets of findings (clear + professional)
-  2) show assumptions/filters (engine used, time field used, time range, index pattern)
+- When done, answer with a high-quality analyst report:
+  1) Executive summary (2-4 bullets, plain language)
+  2) Key findings (evidence-backed bullets; quote concrete fields/values)
+  3) Assumptions & filters (engine used, time field used, time range, index pattern)
+  4) Suggested next checks (2-4 actionable follow-up queries)
+- Prefer concise but thorough explanations similar to high-quality SOC analyst notes.
 """
 
 PLANNER_PROMPT = """You are a STRICT Elasticsearch query planner.
@@ -594,7 +597,57 @@ def _detect_count_target(text: str) -> Optional[str]:
         return "ransomware"
     if "cve" in t:
         return "cves"
+    if "event" in t or "document" in t or "doc" in t:
+        return "documents"
     return None
+
+
+def _extract_index_hint(text: str) -> Optional[str]:
+    t = text.lower()
+    patterns = [
+        r"\b(?:in|from)\s+(?:the\s+)?([a-z0-9._*?-]+)\s+index\b",
+        r"\b([a-z0-9._*?-]+)\s+index\b",
+    ]
+    for p in patterns:
+        m = re.search(p, t)
+        if m:
+            return (m.group(1) or "").strip()
+    return None
+
+
+def _field_tokens(name: str) -> set[str]:
+    return set(x for x in re.split(r"[^a-z0-9]+", name.lower()) if x)
+
+
+def _semantic_candidates(schema_small: Dict[str, Any], concept: str) -> List[str]:
+    token_map = {
+        "actors": {"actor", "actors", "adversary", "threat", "group", "intrusion", "apt", "campaign"},
+        "cves": {"cve", "vulnerability", "vuln"},
+        "ips": {"ip", "src", "dst", "source", "destination", "client", "server"},
+        "domains": {"domain", "dns", "host", "hostname", "url", "fqdn"},
+        "hashes": {"hash", "sha1", "sha256", "md5", "fingerprint"},
+    }
+    wanted = token_map.get(concept, set())
+    if not wanted:
+        return []
+
+    scored: List[Tuple[int, str]] = []
+    for f in schema_small.get("sample_fields") or []:
+        if not isinstance(f, dict):
+            continue
+        name = str(f.get("field") or "")
+        if not name:
+            continue
+        if not bool(f.get("aggregatable", False)):
+            continue
+        toks = _field_tokens(name)
+        overlap = len(toks & wanted)
+        if overlap <= 0:
+            continue
+        scored.append((overlap, name))
+
+    scored.sort(key=lambda x: (-x[0], len(x[1])))
+    return [name for _, name in scored[:20]]
 
 def _has_time_phrase(text: str) -> bool:
     tf, _ = _extract_time_window(text)
@@ -617,52 +670,165 @@ class NL2ESAgent:
         st = self._state_get(conversation_id)
         st.update(kwargs)
 
+    async def _resolve_pattern_from_hint(self, hint: Optional[str]) -> Optional[str]:
+        if not hint:
+            return None
+        allowed = self.tools.ctx.settings.es_allowed_patterns
+        # Exact/prefix substring score over allowlist entries (deterministic, no LLM)
+        scored = []
+        for p in allowed:
+            ps = p.lower()
+            hs = hint.lower()
+            score = 0
+            if hs == ps:
+                score += 100
+            if hs in ps:
+                score += 30
+            if ps.startswith(hs):
+                score += 40
+            if hs.rstrip('*') and hs.rstrip('*') in ps:
+                score += 20
+            scored.append((score, p))
+        scored.sort(key=lambda x: (-x[0], len(x[1])))
+        best = scored[0][1] if scored and scored[0][0] > 0 else None
+        return best
+
+
+    def _trace_reasoning(self, trace: List[Dict[str, Any]], text: str) -> None:
+        trace.append({"type": "reasoning", "reasoning": text})
+
+    def _trace_tool_call(
+        self,
+        trace: List[Dict[str, Any]],
+        tool_id: str,
+        params: Dict[str, Any],
+        result: Any,
+        progression: Optional[List[str]] = None,
+    ) -> None:
+        trace.append({
+            "type": "tool_call",
+            "tool_id": tool_id,
+            "progression": [{"message": m} for m in (progression or [])],
+            "params": _clip_any(params),
+            "result": _clip_any(result),
+        })
+
+    def _score_index_name(self, hint: str, name: str) -> int:
+        hs = hint.lower().strip()
+        ns = name.lower().strip()
+        score = 0
+        if hs == ns:
+            score += 120
+        if ns.startswith(hs):
+            score += 60
+        if hs in ns:
+            score += 40
+        h0 = hs.rstrip("*?")
+        if h0 and h0 in ns:
+            score += 20
+        return score
+
+    async def _resolve_index_from_hint_by_listing(self, hint: str, trace: List[Dict[str, Any]]) -> Optional[str]:
+        self._trace_reasoning(trace, f"Trying to resolve user index hint '{hint}' by listing allowed patterns.")
+        res = await self.tools.run("resolve_index", {"hint": hint, "max_results": 500})
+        self._trace_tool_call(
+            trace,
+            tool_id="resolve_index",
+            params={"hint": hint, "max_results": 500},
+            result=res,
+            progression=["Identifying the most relevant data source"],
+        )
+        if isinstance(res, dict):
+            best = (res.get("best_index") or "").strip() or None
+            if best:
+                self._trace_reasoning(trace, f"Resolved hint '{hint}' to concrete index '{best}'.")
+                return best
+        self._trace_reasoning(trace, f"Could not confidently resolve hint '{hint}' to a concrete index.")
+        return None
+
     # -------------------------
     # Schema-first
     # -------------------------
     async def _schema_first(self, messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any], str, List[Dict[str, Any]]]:
         trace: List[Dict[str, Any]] = []
         allowed = self.tools.ctx.settings.es_allowed_patterns
+        hint = _extract_index_hint((messages[-1].get("content") or "") if messages else "")
 
-        schema_prompt = (
-            "MANDATORY STEP (schema-first): Choose ONE best index pattern from this allowlist:\n"
-            f"{allowed}\n"
-            "Then CALL get_mappings(pattern=<chosen pattern>) EXACTLY ONCE.\n"
-            "Do NOT call any other tool in this step."
-        )
+        selected_pattern: Optional[str] = None
+        if hint:
+            self._trace_reasoning(trace, f"User asked for index hint '{hint}'. Trying deterministic index resolution first.")
+            selected_pattern = await self._resolve_index_from_hint_by_listing(hint, trace)
+            if not selected_pattern:
+                selected_pattern = await self._resolve_pattern_from_hint(hint)
+                if selected_pattern:
+                    self._trace_reasoning(trace, f"Hint matched allowlisted pattern '{selected_pattern}'.")
 
-        only_get_mappings = [t for t in self.tools.schemas() if (t.get("function") or {}).get("name") == "get_mappings"]
-        schema_messages = _trim_context(messages + [{"role": "system", "content": schema_prompt}], max_chars=90_000)
+        if not selected_pattern and len(allowed) == 1:
+            selected_pattern = allowed[0]
+            self._trace_reasoning(trace, f"Only one allowed pattern '{selected_pattern}', selecting it deterministically.")
 
-        resp = await self.llm.chat(messages=schema_messages, tools=only_get_mappings, tool_choice="auto")
-        msg = (resp.get("choices") or [{}])[0].get("message") or {}
-        tool_calls = _extract_tool_calls(msg)
+        if not selected_pattern:
+            schema_prompt = (
+                "MANDATORY STEP (schema-first): Choose ONE best index pattern from this allowlist:\n"
+                f"{allowed}\n"
+                + (f"User index hint: {hint}. Prefer it if valid.\n" if hint else "")
+                + "Then CALL get_mappings(pattern=<chosen pattern>) EXACTLY ONCE.\n"
+                + "Do NOT call any other tool in this step."
+            )
 
-        if not tool_calls or (tool_calls[0].get("function") or {}).get("name") != "get_mappings":
+            only_get_mappings = [t for t in self.tools.schemas() if (t.get("function") or {}).get("name") == "get_mappings"]
+            schema_messages = _trim_context(messages + [{"role": "system", "content": schema_prompt}], max_chars=90_000)
+
+            resp = await self.llm.chat(messages=schema_messages, tools=only_get_mappings, tool_choice="auto")
+            msg = (resp.get("choices") or [{}])[0].get("message") or {}
+            tool_calls = _extract_tool_calls(msg)
+
+            if not tool_calls or (tool_calls[0].get("function") or {}).get("name") != "get_mappings":
+                selected_pattern = allowed[0]
+                tool_calls = [{
+                    "id": "schema0",
+                    "type": "function",
+                    "function": {"name": "get_mappings", "arguments": json.dumps({"pattern": selected_pattern, "max_fields": 400})}
+                }]
+                messages.append({"role": "assistant", "content": "", "tool_calls": tool_calls})
+                self._trace_reasoning(trace, f"LLM did not choose get_mappings; fallback to first allowlisted pattern '{selected_pattern}'.")
+            else:
+                messages.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": tool_calls})
+                try:
+                    args = json.loads((tool_calls[0].get("function") or {}).get("arguments") or "{}")
+                except Exception:
+                    args = {"pattern": allowed[0], "max_fields": 400}
+                selected_pattern = (args.get("pattern") or allowed[0]).strip()
+
+            fn = tool_calls[0]["function"]
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except Exception:
+                args = {"pattern": selected_pattern, "max_fields": 400}
+            selected_pattern = (args.get("pattern") or selected_pattern or allowed[0]).strip()
+        else:
+            args = {"pattern": selected_pattern, "max_fields": 400}
             tool_calls = [{
                 "id": "schema0",
                 "type": "function",
-                "function": {"name": "get_mappings", "arguments": json.dumps({"pattern": allowed[0], "max_fields": 400})}
+                "function": {"name": "get_mappings", "arguments": json.dumps(args)}
             }]
             messages.append({"role": "assistant", "content": "", "tool_calls": tool_calls})
-            selected_pattern = allowed[0]
-        else:
-            messages.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": tool_calls})
-            try:
-                args = json.loads((tool_calls[0].get("function") or {}).get("arguments") or "{}")
-            except Exception:
-                args = {"pattern": allowed[0], "max_fields": 400}
-            selected_pattern = (args.get("pattern") or allowed[0]).strip()
 
-        fn = tool_calls[0]["function"]
-        try:
-            args = json.loads(fn.get("arguments") or "{}")
-        except Exception:
-            args = {"pattern": selected_pattern, "max_fields": 400}
-
+        self._trace_tool_call(
+            trace,
+            tool_id="get_mappings",
+            params=args,
+            result={"note": "executing"},
+            progression=["Discovering schema before search"],
+        )
         result_full = await self.tools.run("get_mappings", args)
         result_small = _sanitize_tool_result("get_mappings", result_full)
         tool_content = _clip_text(json.dumps(result_small, ensure_ascii=False), MAX_TOOL_MESSAGE_CHARS)
+
+        # update last tool_call entry with actual result
+        if trace and trace[-1].get("type") == "tool_call" and trace[-1].get("tool_id") == "get_mappings":
+            trace[-1]["result"] = _clip_any(result_small)
 
         messages.append({"role": "tool", "tool_call_id": tool_calls[0].get("id", "schema0"), "content": tool_content})
         trace.append({"step": "schema_first", "pattern": selected_pattern})
@@ -671,10 +837,35 @@ class NL2ESAgent:
     # -------------------------
     # COUNT engine (exact) + follow-ups
     # -------------------------
-    async def _count_docs(self, pattern: str, query: Dict[str, Any]) -> int:
-        resp = await self.tools.ctx.es.count(index=pattern, query=query)
-        resp = getattr(resp, "body", resp)
-        return int((resp or {}).get("count", 0) or 0)
+    async def _count_docs(
+        self,
+        pattern: str,
+        query: Dict[str, Any],
+        time_field: Optional[str] = None,
+        time_from: Optional[str] = None,
+        time_to: Optional[str] = None,
+        trace: Optional[List[Dict[str, Any]]] = None,
+    ) -> int:
+        args: Dict[str, Any] = {"index": pattern, "query": query}
+        if time_field:
+            args["time_field"] = time_field
+        if time_from:
+            args["time_from"] = time_from
+        if time_to:
+            args["time_to"] = time_to
+
+        res = await self.tools.run("count_docs", args)
+        if trace is not None:
+            self._trace_tool_call(
+                trace,
+                tool_id="count_docs",
+                params=args,
+                result=res,
+                progression=["Computing exact count"],
+            )
+        if isinstance(res, dict) and isinstance(res.get("count"), int):
+            return int(res.get("count") or 0)
+        return 0
 
     async def _unique_terms_count_composite(
         self,
@@ -795,13 +986,46 @@ class NL2ESAgent:
         # Store time/topic for follow-ups
         self._state_update(conversation_id, last_time_from=time_from, last_time_to=time_to, last_topic=target)
 
+        # ---- Generic documents/events/doc count ----
+        if target == "documents":
+            query = {"bool": {"filter": [{"range": {time_field: {"gte": time_from, "lte": time_to}}}] if time_field else [],
+                              "must": [{"match_all": {}}]}}
+            doc_count = await self._count_docs(pattern, query, trace=trace)
+
+            answer = "\n".join([
+                "### Document count",
+                f"- **Documents matched:** **{doc_count}**",
+                "",
+                "**Filters used**",
+                "- Engine: `DSL`",
+                f"- Index pattern: `{pattern}`",
+                f"- Time field: `{time_field}`",
+                f"- Time range: `{time_from}` → `{time_to}`",
+                "- Query: `match_all`",
+            ])
+
+            artifact = {
+                "index": pattern,
+                "dsl": {"query": query},
+                "stage": "count_documents",
+                "engine": "dsl",
+                "time_field_used": time_field,
+                "time_range": {"from": time_from, "to": time_to},
+                "count": doc_count,
+                "hits": [],
+            }
+
+            self._state_update(conversation_id, last_count_target="documents")
+            trace.append({"step": "count", "target": "documents", "docs": doc_count})
+            return answer, artifact
+
         # ---- RANSOMWARE doc count ----
         if target == "ransomware":
             q = {"simple_query_string": {"query": "ransomware", "fields": ["*"], "default_operator": "and"}}
             query = {"bool": {"filter": [{"range": {time_field: {"gte": time_from, "lte": time_to}}}] if time_field else [],
                               "must": [q]}}
 
-            doc_count = await self._count_docs(pattern, query)
+            doc_count = await self._count_docs(pattern, query, trace=trace)
 
             answer = "\n".join([
                 "### Ransomware incidents (document count)",
@@ -865,7 +1089,7 @@ class NL2ESAgent:
 
             query_docs = {"bool": {"filter": [{"range": {time_field: {"gte": time_from, "lte": time_to}}}] if time_field else [],
                                    "must": [q_docs]}}
-            docs_with_cve = await self._count_docs(pattern, query_docs)
+            docs_with_cve = await self._count_docs(pattern, query_docs, trace=trace)
 
             unique_cves = None
             unique_exact = None
@@ -1459,21 +1683,26 @@ class NL2ESAgent:
 
         if entity == "actors":
             label = "threat actors"
-            candidates = ["threat.group.name", "entities.threat_actors", "threat_actor", "threat_actors", "actor", "adversary"]
         elif entity == "cves":
             label = "CVEs"
-            candidates = ["entities.cves", "cve", "cves", "cve_id"]
         elif entity == "ips":
             label = "IPs"
-            candidates = ["entities.ips", "source.ip", "destination.ip", "ip", "ips"]
         elif entity == "domains":
             label = "domains"
-            candidates = ["entities.domains", "domain", "domains", "url.domain", "host.name"]
         elif entity == "hashes":
             label = "hashes"
-            candidates = ["entities.hashes", "sha256", "sha1", "md5", "hash", "hashes"]
         else:
             return None, None
+
+        candidates = _semantic_candidates(schema_small, entity)
+        if not candidates:
+            return None, {
+                "index": pattern,
+                "stage": f"top_{label}_no_schema_candidates",
+                "time_range": {"from": time_from, "to": time_to},
+                "hits": [],
+                "count": 0,
+            }
 
         answer, artifact = await self._execute_top_terms(pattern, schema_small, time_from, time_to, top_n, candidates, label)
         trace.append({"step": "top_terms", "entity": entity, "stage": artifact.get("stage"), "field_used": artifact.get("field_used")})
@@ -1582,4 +1811,3 @@ class NL2ESAgent:
 
         self.store.set(conversation_id, messages)
         return answer, artifact, trace
-

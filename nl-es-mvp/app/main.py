@@ -12,7 +12,7 @@ from .schema_cache import SchemaCache
 from .agent import NL2ESAgent
 from .tools.base import ToolContext
 from .tools.registry import ToolRegistry
-from .tools import ListIndicesTool, GetMappingsTool, EsqlQueryTool, DslSearchTool, GetDocTool
+from .tools import ListIndicesTool, GetMappingsTool, EsqlQueryTool, DslSearchTool, GetDocTool, ResolveIndexTool, CountDocsTool
 
 load_dotenv()
 
@@ -81,7 +81,9 @@ async def startup():
 
     # Register tools
     registry.register(ListIndicesTool())
+    registry.register(ResolveIndexTool())
     registry.register(GetMappingsTool())
+    registry.register(CountDocsTool())
     registry.register(EsqlQueryTool())
     registry.register(DslSearchTool())
     registry.register(GetDocTool())

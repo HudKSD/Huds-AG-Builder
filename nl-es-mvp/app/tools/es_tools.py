@@ -12,7 +12,12 @@ def _is_allowed_source(source: str, allowed_patterns: List[str]) -> bool:
     source = source.strip().strip('"').strip("'")
     has_wildcards = ("*" in source) or ("?" in source)
     if has_wildcards:
-        # safest: only allow exact allowlisted patterns when wildcards are present
+        # Allow narrower wildcard patterns derived from allowed prefixes (e.g., logs-security-* under logs-*)
+        src_prefix = re.split(r"[\*\?]", source, maxsplit=1)[0]
+        for pat in allowed_patterns:
+            pat_prefix = re.split(r"[\*\?]", pat, maxsplit=1)[0]
+            if src_prefix.startswith(pat_prefix):
+                return True
         return source in allowed_patterns
     # concrete index name
     return any(fnmatch.fnmatch(source, pat) for pat in allowed_patterns)
@@ -83,6 +88,7 @@ async def _field_caps_for_fields(ctx: ToolContext, index: str, fields: List[str]
 
     try:
         resp = await ctx.es.field_caps(index=index, fields=fields_param)
+        resp = getattr(resp, "body", resp)
     except Exception:
         # Fallback to raw request
         try:
@@ -120,6 +126,7 @@ async def _pick_time_field_by_probe(
     for f in candidates[:12]:
         try:
             r = await ctx.es.count(index=index, query={"range": {f: {"gte": gte, "lte": lte}}})
+            r = getattr(r, "body", r)
             if (r or {}).get("count", 0) > 0:
                 return f
         except Exception:
@@ -324,6 +331,7 @@ class EsqlQueryTool(Tool):
         dsl_filter = _build_filter(time_field, time_from, time_to, extra_filter)
 
         resp = await ctx.es.esql.query(query=safe_query, filter=dsl_filter, format="json")
+        resp = getattr(resp, "body", resp)
 
         columns = resp.get("columns", []) or []
         values = resp.get("values", []) or []
@@ -420,6 +428,123 @@ class DslSearchTool(Tool):
         }
 
 
+class ResolveIndexTool(Tool):
+    name = "resolve_index"
+    description = "Resolve a natural-language index hint to the best concrete index within allowed patterns."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "hint": {"type": "string", "description": "Index hint from user text, e.g. detections."},
+            "max_results": {"type": "integer", "minimum": 1, "maximum": 2000, "default": 300}
+        },
+        "required": ["hint"]
+    }
+
+    async def run(self, args: Dict[str, Any], ctx: ToolContext) -> Any:
+        hint = (args.get("hint") or "").strip().lower()
+        if not hint:
+            return {"error": "hint is required"}
+
+        max_results = int(args.get("max_results", 300))
+        max_results = max(1, min(max_results, 2000))
+
+        discovered: List[str] = []
+        for pat in ctx.settings.es_allowed_patterns:
+            try:
+                rows = await ctx.es.cat.indices(index=pat, format="json")
+                rows = getattr(rows, "body", rows)
+                names = [r.get("index") for r in (rows or []) if isinstance(r, dict) and r.get("index")]
+            except Exception:
+                try:
+                    resp = await ctx.es.indices.get(index=pat, allow_no_indices=True)
+                    resp = getattr(resp, "body", resp)
+                    names = list((resp or {}).keys())
+                except Exception:
+                    names = []
+            discovered.extend(names)
+
+        uniq = sorted(set(discovered))[:max_results]
+
+        def score(name: str) -> int:
+            ns = name.lower()
+            hs = hint.rstrip("*?")
+            sc = 0
+            if hint == ns:
+                sc += 120
+            if ns.startswith(hint):
+                sc += 70
+            if hint in ns:
+                sc += 40
+            if hs and hs in ns:
+                sc += 25
+            return sc
+
+        ranked = sorted(uniq, key=lambda n: (-score(n), len(n)))
+        best = ranked[0] if ranked and score(ranked[0]) > 0 else None
+
+        return {
+            "hint": hint,
+            "best_index": best,
+            "candidates": ranked[:20],
+            "total_candidates": len(ranked),
+        }
+
+
+class CountDocsTool(Tool):
+    name = "count_docs"
+    description = "Return exact document count for an allowed index/pattern with optional query and time filter."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "index": {"type": "string", "description": "Concrete index or allowed pattern."},
+            "query": {"type": "object", "description": "Optional Query DSL clause for must/filtering."},
+            "time_field": {"type": "string"},
+            "time_from": {"type": "string"},
+            "time_to": {"type": "string"}
+        },
+        "required": ["index"]
+    }
+
+    async def run(self, args: Dict[str, Any], ctx: ToolContext) -> Any:
+        index = (args.get("index") or "").strip()
+        if not _is_allowed_source(index, ctx.settings.es_allowed_patterns):
+            return {"error": f"Index '{index}' not allowed. Allowed patterns: {ctx.settings.es_allowed_patterns}"}
+
+        time_field = (args.get("time_field") or "").strip() or None
+        time_from = args.get("time_from")
+        time_to = args.get("time_to")
+
+        filt: List[Dict[str, Any]] = []
+        if time_field and (time_from or time_to):
+            rr: Dict[str, Any] = {}
+            if time_from:
+                rr["gte"] = time_from
+            if time_to:
+                rr["lte"] = time_to
+            filt.append({"range": {time_field: rr}})
+
+        q = args.get("query")
+        if isinstance(q, dict) and q:
+            # if passed full bool/query body, keep as a must/filter element
+            filt.append(q)
+
+        if not filt:
+            final_q = {"match_all": {}}
+        elif len(filt) == 1:
+            final_q = filt[0]
+        else:
+            final_q = {"bool": {"filter": filt}}
+
+        resp = await ctx.es.count(index=index, query=final_q)
+        resp = getattr(resp, "body", resp)
+
+        return {
+            "index": index,
+            "query": final_q,
+            "count": int((resp or {}).get("count", 0) or 0),
+        }
+
+
 
 
 
@@ -445,5 +570,6 @@ class GetDocTool(Tool):
         if not _is_allowed_source(index, ctx.settings.es_allowed_patterns):
             return {"error": f"Index '{index}' not allowed."}
         doc = await ctx.es.get(index=index, id=args["id"])
+        doc = getattr(doc, "body", doc)
         return {"_index": doc.get("_index"), "_id": doc.get("_id"), "_source": doc.get("_source")}
 
