@@ -12,7 +12,12 @@ def _is_allowed_source(source: str, allowed_patterns: List[str]) -> bool:
     source = source.strip().strip('"').strip("'")
     has_wildcards = ("*" in source) or ("?" in source)
     if has_wildcards:
-        # safest: only allow exact allowlisted patterns when wildcards are present
+        # Allow narrower wildcard patterns derived from allowed prefixes (e.g., logs-security-* under logs-*)
+        src_prefix = re.split(r"[\*\?]", source, maxsplit=1)[0]
+        for pat in allowed_patterns:
+            pat_prefix = re.split(r"[\*\?]", pat, maxsplit=1)[0]
+            if src_prefix.startswith(pat_prefix):
+                return True
         return source in allowed_patterns
     # concrete index name
     return any(fnmatch.fnmatch(source, pat) for pat in allowed_patterns)
@@ -83,6 +88,7 @@ async def _field_caps_for_fields(ctx: ToolContext, index: str, fields: List[str]
 
     try:
         resp = await ctx.es.field_caps(index=index, fields=fields_param)
+        resp = getattr(resp, "body", resp)
     except Exception:
         # Fallback to raw request
         try:
@@ -120,6 +126,7 @@ async def _pick_time_field_by_probe(
     for f in candidates[:12]:
         try:
             r = await ctx.es.count(index=index, query={"range": {f: {"gte": gte, "lte": lte}}})
+            r = getattr(r, "body", r)
             if (r or {}).get("count", 0) > 0:
                 return f
         except Exception:
@@ -324,6 +331,7 @@ class EsqlQueryTool(Tool):
         dsl_filter = _build_filter(time_field, time_from, time_to, extra_filter)
 
         resp = await ctx.es.esql.query(query=safe_query, filter=dsl_filter, format="json")
+        resp = getattr(resp, "body", resp)
 
         columns = resp.get("columns", []) or []
         values = resp.get("values", []) or []
@@ -445,5 +453,6 @@ class GetDocTool(Tool):
         if not _is_allowed_source(index, ctx.settings.es_allowed_patterns):
             return {"error": f"Index '{index}' not allowed."}
         doc = await ctx.es.get(index=index, id=args["id"])
+        doc = getattr(doc, "body", doc)
         return {"_index": doc.get("_index"), "_id": doc.get("_id"), "_source": doc.get("_source")}
 

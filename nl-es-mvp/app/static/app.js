@@ -25,6 +25,7 @@ const hitsWrap = el("hitsWrap");
 const hitsFilter = el("hitsFilter");
 
 const queryUsedEl = el("queryUsed");
+const reasoningBox = el("reasoningBox");
 const traceBox = el("traceBox");
 const rawBox = el("rawBox");
 
@@ -397,6 +398,30 @@ async function checkHealth() {
   }
 }
 
+
+function renderReasoning(trace) {
+  if (!reasoningBox) return;
+  const items = Array.isArray(trace) ? trace : [];
+  if (!items.length) {
+    reasoningBox.innerHTML = `<div class="hint">No reasoning steps captured.</div>`;
+    return;
+  }
+
+  const html = items.map((t, i) => {
+    const kind = t?.type || t?.step || "event";
+    if (t?.type === "reasoning") {
+      return `<div class="reason-step"><div class="t">Reasoning ${i+1}</div><div class="b">${escapeHtml(t.reasoning || "")}</div></div>`;
+    }
+    if (t?.type === "tool_call") {
+      const name = t.tool_id || "tool";
+      const prog = (t.progression || []).map(x => x?.message).filter(Boolean).join(" → ");
+      return `<div class="reason-step tool"><div class="t">Tool: ${escapeHtml(name)}</div><div class="b">${escapeHtml(prog || "Executed.")}</div></div>`;
+    }
+    return `<div class="reason-step"><div class="t">${escapeHtml(String(kind))}</div><div class="b">${escapeHtml(JSON.stringify(t))}</div></div>`;
+  }).join("");
+  reasoningBox.innerHTML = html;
+}
+
 function updatePanelsFromResponse(data) {
   lastResponse = data;
   rawBox.textContent = pretty(data);
@@ -404,6 +429,7 @@ function updatePanelsFromResponse(data) {
   const artifact = data.artifact || {};
   const trace = data.trace || [];
   traceBox.textContent = pretty(trace);
+  renderReasoning(trace);
 
   let queryObj = null;
 
@@ -485,6 +511,7 @@ function clearUI() {
   messagesEl.innerHTML = "";
   hitsWrap.innerHTML = "";
   queryUsedEl.textContent = "";
+  if (reasoningBox) reasoningBox.innerHTML = "";
   traceBox.textContent = "";
   rawBox.textContent = "";
   updateOverview({});
