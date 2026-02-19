@@ -1,0 +1,7 @@
+quart==0.20.0
+hypercorn==0.18.0
+httpx==0.27.0
+jsonschema==4.23.0
+python-dotenv==1.0.1
+elasticsearch[async]==8.19.0
+flashtext==2.7
