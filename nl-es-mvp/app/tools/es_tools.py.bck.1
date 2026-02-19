@@ -1,0 +1,292 @@
+import fnmatch
+import json
+import re
+from typing import Any, Dict, List, Optional
+
+from .base import Tool, ToolContext
+
+def _is_allowed_source(source: str, allowed_patterns: List[str]) -> bool:
+    source = source.strip().strip('"').strip("'")
+    has_wildcards = ("*" in source) or ("?" in source)
+    if has_wildcards:
+        # safest: only allow exact allowed patterns when wildcards are present
+        return source in allowed_patterns
+    # concrete index name
+    return any(fnmatch.fnmatch(source, pat) for pat in allowed_patterns)
+
+def _extract_esql_from_source(query: str) -> Optional[str]:
+    # Capture token after FROM (up to first whitespace or pipe)
+    m = re.search(r"(?i)\bFROM\s+([^\s|]+)", query)
+    if not m:
+        return None
+    return m.group(1)
+
+def _enforce_limit(esql: str, hard_cap: int, requested: Optional[int]) -> str:
+    cap = min(requested or hard_cap, hard_cap)
+
+    # If query already has LIMIT, reduce if needed.
+    m = re.search(r"(?i)\|\s*LIMIT\s+(\d+)\b", esql)
+    if m:
+        n = int(m.group(1))
+        if n > cap:
+            esql = re.sub(r"(?i)(\|\s*LIMIT\s+)\d+\b", rf"\g<1>{cap}", esql)
+        return esql
+
+    # Add LIMIT at end
+    return esql.rstrip() + f"\n| LIMIT {cap}"
+
+def _build_filter(time_field: Optional[str], time_from: Optional[str], time_to: Optional[str], extra: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    parts: List[Dict[str, Any]] = []
+
+    if time_field and (time_from or time_to):
+        r: Dict[str, Any] = {}
+        if time_from:
+            r["gte"] = time_from
+        if time_to:
+            r["lte"] = time_to
+        parts.append({"range": {time_field: r}})
+
+    if extra:
+        parts.append(extra)
+
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return parts[0]
+    return {"bool": {"filter": parts}}
+
+class ListIndicesTool(Tool):
+    name = "list_indices"
+    description = "List indices/data streams matching an allowed pattern (for discovery)."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "pattern": {"type": "string", "description": "Index pattern to list. Should be one of the allowed patterns."},
+            "max_results": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50}
+        },
+        "required": ["pattern"]
+    }
+
+    async def run(self, args: Dict[str, Any], ctx: ToolContext) -> Any:
+        pattern = args["pattern"].strip()
+        if not _is_allowed_source(pattern, ctx.settings.es_allowed_patterns):
+            return {"error": f"Index/pattern not allowed. Allowed patterns: {ctx.settings.es_allowed_patterns}"}
+
+        max_results = int(args.get("max_results", 50))
+        max_results = min(max_results, 500)
+
+        # Try cat.indices first (simple)
+        try:
+            rows = await ctx.es.cat.indices(index=pattern, format="json")
+            names = [r.get("index") for r in rows if r.get("index")]
+            return {"pattern": pattern, "count": len(names), "indices": names[:max_results]}
+        except Exception:
+            # Fallback: indices.get (keys are indices)
+            resp = await ctx.es.indices.get(index=pattern, allow_no_indices=True)
+            names = list((resp or {}).keys())
+            return {"pattern": pattern, "count": len(names), "indices": names[:max_results]}
+
+class GetMappingsTool(Tool):
+    name = "get_mappings"
+    description = "Get flattened mapping fields (field -> type) and candidate date fields for an allowed pattern."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "pattern": {"type": "string", "description": "One of the allowed index patterns."},
+            "max_fields": {"type": "integer", "minimum": 10, "maximum": 2000, "default": 250}
+        },
+        "required": ["pattern"]
+    }
+
+    async def run(self, args: Dict[str, Any], ctx: ToolContext) -> Any:
+        pattern = args["pattern"].strip()
+        if pattern not in ctx.settings.es_allowed_patterns:
+            return {"error": f"Pattern not allowed. Allowed: {ctx.settings.es_allowed_patterns}"}
+
+        max_fields = int(args.get("max_fields", 250))
+        fields, date_fields = await ctx.schema_cache.get_flat_fields(pattern)
+        items = list(fields.items())[:max_fields]
+        return {
+            "pattern": pattern,
+            "field_count": len(fields),
+            "sample_fields": [{"field": k, "type": v} for k, v in items],
+            "date_fields": date_fields[:20],
+        }
+
+class EsqlQueryTool(Tool):
+    name = "esql_query"
+    description = (
+        "Run an ES|QL query safely. Must use FROM <allowed pattern> or a concrete index matching allowed patterns. "
+        "A time-range filter is applied via Query DSL 'filter' unless you omit it."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "ES|QL query string. Example: FROM logs-* | KEEP @timestamp, message"},
+            "time_field": {"type": "string", "description": "Date field for time filter, e.g. @timestamp"},
+            "time_from": {"type": "string", "description": "Start (date math or ISO), e.g. now-6h"},
+            "time_to": {"type": "string", "description": "End (date math or ISO), e.g. now"},
+            "filter": {"type": "object", "description": "Extra Query DSL filter object to AND with time filter."},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Row limit (hard-capped by server ROW_LIMIT)."}
+        },
+        "required": ["query"]
+    }
+
+    async def run(self, args: Dict[str, Any], ctx: ToolContext) -> Any:
+        raw_query = args["query"].strip()
+        src = _extract_esql_from_source(raw_query)
+        if not src:
+            return {"error": "ES|QL query must include FROM <index-pattern>."}
+
+        # Validate allowed source
+        if not _is_allowed_source(src, ctx.settings.es_allowed_patterns):
+            return {"error": f"FROM source '{src}' not allowed. Allowed patterns: {ctx.settings.es_allowed_patterns}"}
+
+        # Normalize time window defaults
+        time_field = args.get("time_field")
+        time_from = args.get("time_from") or ctx.settings.default_time_from
+        time_to = args.get("time_to") or ctx.settings.default_time_to
+        extra_filter = args.get("filter")
+
+        # If no time_field given, try to guess from cached date fields
+        if not time_field:
+            # If source is an allowed pattern, use that directly; else pick first allowed pattern that matches
+            source_str = src.strip().strip('"').strip("'")
+            pattern_for_cache = source_str if source_str in ctx.settings.es_allowed_patterns else None
+            if not pattern_for_cache:
+                for pat in ctx.settings.es_allowed_patterns:
+                    if fnmatch.fnmatch(source_str, pat):
+                        pattern_for_cache = pat
+                        break
+            if pattern_for_cache:
+                _, date_fields = await ctx.schema_cache.get_flat_fields(pattern_for_cache)
+                if date_fields:
+                    time_field = date_fields[0]  # prefers @timestamp if present
+
+        # Enforce LIMIT cap
+        safe_query = _enforce_limit(raw_query, ctx.settings.row_limit, args.get("limit"))
+
+        # Build Query DSL filter for ES|QL
+        dsl_filter = _build_filter(time_field, time_from, time_to, extra_filter)
+
+        # Execute
+        resp = await ctx.es.esql.query(query=safe_query, filter=dsl_filter, format="json")
+
+        columns = resp.get("columns", []) or []
+        values = resp.get("values", []) or []
+
+        col_names = [c.get("name", "") for c in columns]
+        # hard truncate (even if ES returns more for some reason)
+        values = values[: ctx.settings.row_limit]
+
+        return {
+            "query": safe_query,
+            "filter": dsl_filter,
+            "took": resp.get("took"),
+            "columns": col_names,
+            "rows": values,
+            "row_count": len(values),
+        }
+
+
+
+#######################################3
+
+
+class DslSearchTool(Tool):
+    name = "dsl_search"
+    description = (
+        "Run an Elasticsearch Query DSL _search against an allowed index/pattern. "
+        "Provide either 'query' (query clause) or 'body' (full request). "
+        "If neither is provided, it defaults to match_all."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "index": {"type": "string", "description": "Concrete index or allowed pattern."},
+            "query": {"type": "object", "description": "Query clause OR full body (we auto-detect). Optional."},
+            "body": {"type": "object", "description": "Full _search body. Optional alternative to 'query'."},
+            "size": {"type": "integer", "minimum": 1, "maximum": 200, "default": 10},
+            "_source": {"type": "array", "items": {"type": "string"}, "description": "Optional _source fields."}
+        },
+        "required": ["index"]
+    }
+
+    async def run(self, args: Dict[str, Any], ctx: ToolContext) -> Any:
+        index = args["index"].strip()
+        if not _is_allowed_source(index, ctx.settings.es_allowed_patterns):
+            return {"error": f"Index '{index}' not allowed. Allowed patterns: {ctx.settings.es_allowed_patterns}"}
+
+        size = min(int(args.get("size", 10)), 200)
+        size = min(size, ctx.settings.row_limit)
+
+        body = args.get("body")
+        q = args.get("query")
+
+        # Default if model forgot query/body
+        if body is None and q is None:
+            q = {"match_all": {}}
+
+        if body is None:
+            # If 'query' looks like a full body already, use it as-is
+            if isinstance(q, dict) and any(k in q for k in ("query", "aggs", "sort", "size", "_source")):
+                body = q
+            else:
+                body = {"query": q}
+
+        body["size"] = size
+        if args.get("_source"):
+            body["_source"] = args["_source"]
+
+        resp = await ctx.es.search(index=index, body=body)
+        hits = (resp.get("hits") or {}).get("hits") or []
+
+        out_hits = []
+        for h in hits[:size]:
+            out_hits.append({
+                "_index": h.get("_index"),
+                "_id": h.get("_id"),
+                "_score": h.get("_score"),
+                "_source": h.get("_source"),
+            })
+        return {"index": index, "count": len(out_hits), "hits": out_hits}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+class GetDocTool(Tool):
+    name = "get_doc"
+    description = "Fetch a single document by index and _id (for 'show me full event')."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "index": {"type": "string", "description": "Concrete index (must match allowed patterns)."},
+            "id": {"type": "string", "description": "Document _id."}
+        },
+        "required": ["index", "id"]
+    }
+
+    async def run(self, args: Dict[str, Any], ctx: ToolContext) -> Any:
+        index = args["index"].strip()
+        if not _is_allowed_source(index, ctx.settings.es_allowed_patterns):
+            return {"error": f"Index '{index}' not allowed."}
+        doc = await ctx.es.get(index=index, id=args["id"])
+        return {"_index": doc.get("_index"), "_id": doc.get("_id"), "_source": doc.get("_source")}
+
