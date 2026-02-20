@@ -12,7 +12,16 @@ from .schema_cache import SchemaCache
 from .agent import NL2ESAgent
 from .tools.base import ToolContext
 from .tools.registry import ToolRegistry
-from .tools import ListIndicesTool, GetMappingsTool, EsqlQueryTool, DslSearchTool, GetDocTool
+from .tools import (
+    ListIndicesTool,
+    GetMappingsTool,
+    EsqlQueryTool,
+    DslSearchTool,
+    CountDocumentsTool,
+    TermsAggregateTool,
+    CapabilityPreflightTool,
+    GetDocTool,
+)
 
 load_dotenv()
 
@@ -82,8 +91,11 @@ async def startup():
     # Register tools
     registry.register(ListIndicesTool())
     registry.register(GetMappingsTool())
+    registry.register(CapabilityPreflightTool())
     registry.register(EsqlQueryTool())
     registry.register(DslSearchTool())
+    registry.register(CountDocumentsTool())
+    registry.register(TermsAggregateTool())
     registry.register(GetDocTool())
 
     agent = NL2ESAgent(llm=llm, tools=registry, store=store, max_steps=settings.max_agent_steps)
@@ -170,7 +182,6 @@ async def chat():
             "conversation_id": conversation_id,
             "error": str(e),
         }), 500
-
 
 
 

@@ -203,6 +203,28 @@ def _sanitize_tool_result(tool_name: str, result: Any) -> Any:
             out["actor_fields"] = (result.get("actor_fields") or [])[:120]
         return out
 
+    if tool_name == "capability_preflight":
+        return {
+            "pattern": result.get("pattern"),
+            "indices_count": result.get("indices_count"),
+            "total_docs": result.get("total_docs"),
+            "preferred_time_field": result.get("preferred_time_field"),
+            "time_fields": (result.get("time_fields") or [])[:20],
+            "aggregatable_fields": (result.get("aggregatable_fields") or [])[:80],
+            "searchable_fields": (result.get("searchable_fields") or [])[:120],
+            "field_count": result.get("field_count"),
+        }
+
+    if tool_name == "terms_aggregate":
+        return {
+            "index": result.get("index"),
+            "field": result.get("field"),
+            "size": result.get("size"),
+            "metric": result.get("metric"),
+            "count": result.get("count"),
+            "items": (result.get("items") or [])[:30],
+        }
+
     return _clip_any(result)
 
 
@@ -590,6 +612,8 @@ def _infer_topic(text: str) -> Optional[str]:
 
 def _detect_count_target(text: str) -> Optional[str]:
     t = text.lower()
+    if "index" in t or "indices" in t:
+        return "indices"
     if "ransomware" in t:
         return "ransomware"
     if "cve" in t:
@@ -649,6 +673,17 @@ def _semantic_candidates(schema_small: Dict[str, Any], concept: str) -> List[str
 def _has_time_phrase(text: str) -> bool:
     tf, _ = _extract_time_window(text)
     return tf is not None
+
+
+def _is_index_inventory_question(text: str) -> bool:
+    t = text.lower().strip()
+    if any(k in t for k in ["list indices", "list index", "show indices", "show index", "which indices", "what indices"]):
+        return True
+    if ("top" in t or "most" in t) and ("index" in t or "indices" in t):
+        return True
+    if ("count" in t or "total" in t or "how many" in t) and ("index" in t or "indices" in t):
+        return True
+    return False
 
 
 class NL2ESAgent:
@@ -840,12 +875,26 @@ class NL2ESAgent:
         trace.append({"step": "schema_first", "pattern": selected_pattern})
         return messages, result_small, selected_pattern, trace
 
+    async def _capability_preflight(self, pattern: str, trace: List[Dict[str, Any]]) -> Dict[str, Any]:
+        args = {"pattern": pattern, "max_fields": 120}
+        self._trace_tool_call(
+            trace,
+            tool_id="capability_preflight",
+            params=args,
+            result={"note": "executing"},
+            progression=["Collecting index capability snapshot"],
+        )
+        result_full = await self.tools.run("capability_preflight", args)
+        result_small = _sanitize_tool_result("capability_preflight", result_full)
+        if trace and trace[-1].get("type") == "tool_call" and trace[-1].get("tool_id") == "capability_preflight":
+            trace[-1]["result"] = _clip_any(result_small)
+        return result_small if isinstance(result_small, dict) else {}
+
     # -------------------------
     # COUNT engine (exact) + follow-ups
     # -------------------------
     async def _count_docs(self, pattern: str, query: Dict[str, Any]) -> int:
-        resp = await self.tools.ctx.es.count(index=pattern, query=query)
-        resp = getattr(resp, "body", resp)
+        resp = await self.tools.run("count_documents", {"index": pattern, "query": query})
         return int((resp or {}).get("count", 0) or 0)
 
     async def _unique_terms_count_composite(
@@ -1125,6 +1174,89 @@ class NL2ESAgent:
 
         return None, None
 
+    async def _handle_index_inventory_request(
+        self,
+        conversation_id: str,
+        user_text: str,
+        trace: List[Dict[str, Any]],
+    ) -> Tuple[str, Dict[str, Any]]:
+        top_n = _extract_top_n(user_text, default=5)
+        rows: List[Dict[str, Any]] = []
+
+        for pat in self.tools.ctx.settings.es_allowed_patterns:
+            res = await self.tools.run("list_indices", {
+                "pattern": pat,
+                "max_results": 500,
+                "include_doc_counts": True,
+                "sort_by": "docs_desc",
+            })
+            items = (res or {}).get("items") or []
+            for it in items:
+                if isinstance(it, dict) and it.get("index"):
+                    rows.append(it)
+
+        by_name: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            nm = str(r.get("index"))
+            prev = by_name.get(nm)
+            if (not prev) or int(r.get("docs_count") or 0) > int(prev.get("docs_count") or 0):
+                by_name[nm] = r
+
+        uniq = list(by_name.values())
+        uniq.sort(key=lambda x: (-int(x.get("docs_count") or 0), str(x.get("index"))))
+        total_docs = sum(int(x.get("docs_count") or 0) for x in uniq)
+
+        answer_lines = [
+            "### Index inventory",
+            f"- **Total indices (within allowlist):** **{len(uniq)}**",
+            f"- **Total documents across those indices:** **{total_docs}**",
+            "",
+            f"**Top {top_n} indices by document count**",
+        ]
+        for i, r in enumerate(uniq[:top_n], 1):
+            answer_lines.append(f"{i}. **{r.get('index')}** — {int(r.get('docs_count') or 0)} docs")
+
+        answer_lines += [
+            "",
+            "**Filters used**",
+            "- Engine: `CAT indices`",
+            f"- Allowed patterns: `{', '.join(self.tools.ctx.settings.es_allowed_patterns)}`",
+        ]
+
+        artifact = {
+            "stage": "count_indices",
+            "engine": "cat_indices",
+            "count": len(uniq),
+            "total_docs": total_docs,
+            "top_n": top_n,
+            "items": uniq[:100],
+        }
+
+        self._state_update(conversation_id, last_count_target="indices")
+        trace.append({"step": "count", "target": "indices", "indices": len(uniq), "docs": total_docs})
+        return "\n".join(answer_lines), artifact
+
+    def _verify_answer_against_artifact(self, answer: str, artifact: Dict[str, Any]) -> Tuple[str, List[str]]:
+        warnings: List[str] = []
+        if not isinstance(artifact, dict):
+            return answer, warnings
+
+        count_val = artifact.get("count")
+        if isinstance(count_val, int):
+            nums = {int(x) for x in re.findall(r"\b\d+\b", answer or "")}
+            if count_val not in nums and count_val > 0:
+                warnings.append(f"Answer may not mention artifact count={count_val}.")
+
+        if artifact.get("stage") == "count_indices" and isinstance(artifact.get("total_docs"), int):
+            td = int(artifact.get("total_docs") or 0)
+            if td > 0 and td not in {int(x) for x in re.findall(r"\b\d+\b", answer or "")}:
+                warnings.append("Answer may omit total_docs from index inventory artifact.")
+
+        if warnings:
+            note = "\n\n**Verification notes**\n" + "\n".join(f"- {w}" for w in warnings)
+            return (answer or "") + note, warnings
+        return answer, warnings
+
     # -------------------------
     # Planner (DSL)
     # -------------------------
@@ -1291,25 +1423,31 @@ class NL2ESAgent:
         metric_field = str(metric.get("field") or "").strip()
         metric_field_res = _resolve_field(metric_field, fields_map) if metric_field else None
 
-        aggs: Dict[str, Any] = {
-            "top_terms": {
-                "terms": {"field": agg_field, "size": top_n, "order": {"_count": "desc"}}
-            }
-        }
-
+        query_clause: Dict[str, Any] = {"bool": {"filter": filter_list, "must": must, "must_not": must_not}}
+        metric_obj: Optional[Dict[str, Any]] = None
         if metric_fn in ("avg", "sum", "min", "max") and metric_field_res:
-            aggs["top_terms"]["aggs"] = {"metric": {metric_fn: {"field": metric_field_res}}}
+            metric_obj = {"fn": metric_fn, "field": metric_field_res}
 
-        body = {
-            "size": 0,
-            "query": {"bool": {"filter": filter_list, "must": must, "must_not": must_not}},
-            "aggs": aggs,
-            "track_total_hits": False
-        }
-
-        res = await self.tools.run("dsl_search", {"index": pattern, "body": body, "size": 0})
+        res = await self.tools.run(
+            "terms_aggregate",
+            {
+                "index": pattern,
+                "field": agg_field,
+                "size": top_n,
+                "query": query_clause,
+                **({"metric": metric_obj} if metric_obj else {}),
+            },
+        )
+        rows = (res or {}).get("items") or []
+        buckets = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            b = {"key": row.get("key"), "doc_count": row.get("doc_count")}
+            if "metric" in row:
+                b["metric"] = {"value": row.get("metric")}
+            buckets.append(b)
         aggs_res = (res or {}).get("aggregations") or {}
-        buckets = ((aggs_res.get("top_terms") or {}).get("buckets") or [])
 
         pseudo_hits = []
         for b in buckets:
@@ -1320,7 +1458,7 @@ class NL2ESAgent:
 
         artifact = {
             "index": pattern,
-            "dsl": body,
+            "dsl": {"query": query_clause},
             "stage": "dsl_terms_agg",
             "time_field_used": time_field,
             "field_used": agg_field,
@@ -1702,6 +1840,13 @@ class NL2ESAgent:
 
         trace: List[Dict[str, Any]] = []
 
+        if _is_index_inventory_question(user_text):
+            idx_answer, idx_artifact = await self._handle_index_inventory_request(conversation_id, user_text, trace)
+            messages.append({"role": "assistant", "content": idx_answer})
+            messages = _trim_context(messages)
+            self.store.set(conversation_id, messages)
+            return idx_answer, idx_artifact, trace
+
         # Update topic/time state for follow-ups
         topic = _infer_topic(user_text)
         if topic:
@@ -1713,10 +1858,15 @@ class NL2ESAgent:
         # 1) schema-first
         messages, schema_small, pattern, tr = await self._schema_first(messages)
         trace.extend(tr)
+        preflight = await self._capability_preflight(pattern, trace)
+        trace.append({"step": "preflight", "pattern": pattern, "summary": _clip_any(preflight)})
 
         # 2) COUNT handler (fixes your wrong “top terms” output for count questions)
         count_answer, count_artifact = await self._handle_count_request(conversation_id, user_text, pattern, schema_small, trace)
         if count_answer and count_artifact is not None:
+            count_answer, verify_warnings = self._verify_answer_against_artifact(count_answer, count_artifact)
+            if verify_warnings:
+                trace.append({"step": "verify", "warnings": verify_warnings})
             messages.append({"role": "assistant", "content": count_answer})
             messages = _trim_context(messages)
             self.store.set(conversation_id, messages)
@@ -1725,6 +1875,9 @@ class NL2ESAgent:
         # 3) deterministic top-N entities (DSL aggregations)
         top_answer, top_artifact = await self._maybe_handle_top_entities(user_text, pattern, schema_small, trace)
         if top_answer and top_artifact is not None:
+            top_answer, verify_warnings = self._verify_answer_against_artifact(top_answer, top_artifact)
+            if verify_warnings:
+                trace.append({"step": "verify", "warnings": verify_warnings})
             # store state for follow-up counts
             self._state_update(conversation_id, last_top_entity=_detect_top_entity(user_text))
             messages.append({"role": "assistant", "content": top_answer})
@@ -1750,6 +1903,9 @@ class NL2ESAgent:
         # 6) DSL aggregate mode
         if str(plan.get("mode") or "").lower() == "aggregate":
             agg_answer, agg_artifact = await self._execute_terms_agg(pattern, {**plan, "raw_question": user_text}, schema_small)
+            agg_answer, verify_warnings = self._verify_answer_against_artifact(agg_answer, agg_artifact)
+            if verify_warnings:
+                trace.append({"step": "verify", "warnings": verify_warnings})
             messages.append({"role": "assistant", "content": agg_answer})
             messages = _trim_context(messages)
             self.store.set(conversation_id, messages)
@@ -1786,6 +1942,9 @@ class NL2ESAgent:
 
         msg = (resp.get("choices") or [{}])[0].get("message") or {}
         answer = msg.get("content") or "(No answer)"
+        answer, verify_warnings = self._verify_answer_against_artifact(answer, artifact)
+        if verify_warnings:
+            trace.append({"step": "verify", "warnings": verify_warnings})
 
         messages.append({"role": "assistant", "content": answer})
         messages = _trim_context(messages)

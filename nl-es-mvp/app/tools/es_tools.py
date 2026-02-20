@@ -144,7 +144,14 @@ class ListIndicesTool(Tool):
         "type": "object",
         "properties": {
             "pattern": {"type": "string", "description": "Index pattern to list. Must match allowlist."},
-            "max_results": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50}
+            "max_results": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50},
+            "include_doc_counts": {"type": "boolean", "default": False},
+            "sort_by": {
+                "type": "string",
+                "enum": ["name", "docs_desc", "docs_asc"],
+                "default": "name",
+                "description": "Sort order when include_doc_counts=true."
+            }
         },
         "required": ["pattern"]
     }
@@ -157,10 +164,48 @@ class ListIndicesTool(Tool):
         max_results = int(args.get("max_results", 50))
         max_results = min(max_results, 500)
 
+        include_doc_counts = bool(args.get("include_doc_counts", False))
+        sort_by = str(args.get("sort_by", "name"))
+
         try:
-            rows = await ctx.es.cat.indices(index=pattern, format="json")
-            names = [r.get("index") for r in rows if r.get("index")]
-            return {"pattern": pattern, "count": len(names), "indices": names[:max_results]}
+            rows = await ctx.es.cat.indices(
+                index=pattern,
+                format="json",
+                h="index,docs.count,health,status",
+                expand_wildcards="open,hidden"
+            )
+            rows = getattr(rows, "body", rows)
+
+            parsed = []
+            for r in (rows or []):
+                idx = r.get("index")
+                if not idx:
+                    continue
+                docs_raw = str(r.get("docs.count") or "0").replace(",", "")
+                try:
+                    docs_count = int(docs_raw)
+                except Exception:
+                    docs_count = 0
+                parsed.append({
+                    "index": idx,
+                    "docs_count": docs_count,
+                    "health": r.get("health"),
+                    "status": r.get("status"),
+                })
+
+            if sort_by == "docs_desc":
+                parsed.sort(key=lambda x: (-x["docs_count"], x["index"]))
+            elif sort_by == "docs_asc":
+                parsed.sort(key=lambda x: (x["docs_count"], x["index"]))
+            else:
+                parsed.sort(key=lambda x: x["index"])
+
+            names = [r["index"] for r in parsed]
+            out: Dict[str, Any] = {"pattern": pattern, "count": len(names), "indices": names[:max_results]}
+            if include_doc_counts:
+                out["items"] = parsed[:max_results]
+                out["total_docs"] = sum(r["docs_count"] for r in parsed)
+            return out
         except Exception:
             resp = await ctx.es.indices.get(index=pattern, allow_no_indices=True)
             names = list((resp or {}).keys())
@@ -428,6 +473,153 @@ class DslSearchTool(Tool):
         }
 
 
+# -----------------------------
+# Tool: count_documents
+# -----------------------------
+class CountDocumentsTool(Tool):
+    name = "count_documents"
+    description = "Run Elasticsearch _count with an optional query filter for an allowed index/pattern."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "index": {"type": "string", "description": "Concrete index or allowed pattern."},
+            "query": {"type": "object", "description": "Query clause. Defaults to match_all."}
+        },
+        "required": ["index"]
+    }
+
+    async def run(self, args: Dict[str, Any], ctx: ToolContext) -> Any:
+        index = args["index"].strip()
+        if not _is_allowed_source(index, ctx.settings.es_allowed_patterns):
+            return {"error": f"Index '{index}' not allowed. Allowed patterns: {ctx.settings.es_allowed_patterns}"}
+
+        query = args.get("query") if isinstance(args.get("query"), dict) else {"match_all": {}}
+
+        resp = await ctx.es.count(index=index, query=query)
+        resp = getattr(resp, "body", resp)
+        return {
+            "index": index,
+            "query": query,
+            "count": int((resp or {}).get("count", 0) or 0),
+        }
+
+
+# -----------------------------
+# Tool: terms_aggregate
+# -----------------------------
+class TermsAggregateTool(Tool):
+    name = "terms_aggregate"
+    description = "Run deterministic terms aggregation (top-N with optional metric) on an allowed index/pattern."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "index": {"type": "string", "description": "Concrete index or allowed pattern."},
+            "field": {"type": "string", "description": "Terms field (keyword-like recommended)."},
+            "size": {"type": "integer", "minimum": 1, "maximum": 100, "default": 10},
+            "query": {"type": "object", "description": "Optional query filter."},
+            "metric": {
+                "type": "object",
+                "properties": {
+                    "fn": {"type": "string", "enum": ["avg", "sum", "min", "max", "count"]},
+                    "field": {"type": "string"}
+                },
+                "required": ["fn"]
+            }
+        },
+        "required": ["index", "field"]
+    }
+
+    async def run(self, args: Dict[str, Any], ctx: ToolContext) -> Any:
+        index = args["index"].strip()
+        if not _is_allowed_source(index, ctx.settings.es_allowed_patterns):
+            return {"error": f"Index '{index}' not allowed. Allowed patterns: {ctx.settings.es_allowed_patterns}"}
+
+        field = str(args["field"]).strip()
+        size = max(1, min(int(args.get("size", 10)), 100))
+        query = args.get("query") if isinstance(args.get("query"), dict) else {"match_all": {}}
+
+        metric = args.get("metric") if isinstance(args.get("metric"), dict) else None
+        metric_fn = str((metric or {}).get("fn") or "count").lower()
+        metric_field = str((metric or {}).get("field") or "").strip()
+
+        aggs: Dict[str, Any] = {
+            "top_terms": {
+                "terms": {"field": field, "size": size, "order": {"_count": "desc"}}
+            }
+        }
+        if metric_fn in ("avg", "sum", "min", "max") and metric_field:
+            aggs["top_terms"]["aggs"] = {"metric": {metric_fn: {"field": metric_field}}}
+
+        body = {
+            "size": 0,
+            "query": query,
+            "aggs": aggs,
+            "track_total_hits": False,
+        }
+        resp = await ctx.es.search(index=index, body=body)
+        resp = getattr(resp, "body", resp)
+        buckets = ((((resp or {}).get("aggregations") or {}).get("top_terms") or {}).get("buckets") or [])
+
+        items = []
+        for b in buckets:
+            row = {"key": b.get("key"), "doc_count": b.get("doc_count")}
+            if isinstance(b.get("metric"), dict):
+                row["metric"] = b["metric"].get("value")
+            items.append(row)
+
+        return {
+            "index": index,
+            "field": field,
+            "size": size,
+            "query": query,
+            "metric": {"fn": metric_fn, "field": metric_field or None},
+            "items": items,
+            "count": len(items),
+            "aggregations": (resp or {}).get("aggregations") or {},
+        }
+
+
+# -----------------------------
+# Tool: capability_preflight
+# -----------------------------
+class CapabilityPreflightTool(Tool):
+    name = "capability_preflight"
+    description = "Return fast capability snapshot for an allowed index/pattern: index counts, time fields, aggregatable/searchable candidates."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "pattern": {"type": "string", "description": "Allowed index pattern or concrete index."},
+            "max_fields": {"type": "integer", "minimum": 20, "maximum": 400, "default": 120}
+        },
+        "required": ["pattern"]
+    }
+
+    async def run(self, args: Dict[str, Any], ctx: ToolContext) -> Any:
+        pattern = args["pattern"].strip()
+        if not _is_allowed_source(pattern, ctx.settings.es_allowed_patterns):
+            return {"error": f"Index/pattern not allowed. Allowed patterns: {ctx.settings.es_allowed_patterns}"}
+
+        max_fields = max(20, min(int(args.get("max_fields", 120)), 400))
+        fields, date_fields = await ctx.schema_cache.get_flat_fields(pattern)
+
+        caps = await _field_caps_for_fields(ctx, pattern, list(fields.keys())[:max_fields])
+        aggregatable = [f for f in fields.keys() if bool((caps.get(f) or {}).get("aggregatable", fields.get(f) == "keyword"))]
+        searchable = [f for f in fields.keys() if bool((caps.get(f) or {}).get("searchable", True))]
+
+        idx_info = await ListIndicesTool().run({"pattern": pattern, "max_results": 500, "include_doc_counts": True, "sort_by": "docs_desc"}, ctx)
+
+        return {
+            "pattern": pattern,
+            "indices_count": int((idx_info or {}).get("count", 0) or 0),
+            "total_docs": int((idx_info or {}).get("total_docs", 0) or 0),
+            "preferred_time_field": date_fields[0] if date_fields else None,
+            "time_fields": date_fields[:20],
+            "aggregatable_fields": aggregatable[:80],
+            "searchable_fields": searchable[:120],
+            "field_count": len(fields),
+        }
+
+
 
 
 
@@ -455,4 +647,3 @@ class GetDocTool(Tool):
         doc = await ctx.es.get(index=index, id=args["id"])
         doc = getattr(doc, "body", doc)
         return {"_index": doc.get("_index"), "_id": doc.get("_id"), "_source": doc.get("_source")}
-
