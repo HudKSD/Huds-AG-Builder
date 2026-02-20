@@ -1,0 +1,120 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg-0: #070214;
+  --bg-1: #110726;
+  --accent-a: #d946ef;
+  --accent-b: #22d3ee;
+  --text: #ece9ff;
+}
+
+body {
+  font-family: Inter, system-ui, sans-serif;
+  background: radial-gradient(circle at 15% 15%, rgba(217, 70, 239, 0.16), transparent 35%),
+    radial-gradient(circle at 85% 10%, rgba(34, 211, 238, 0.14), transparent 40%),
+    var(--bg-0);
+  color: var(--text);
+}
+
+.bg-grid {
+  background-image:
+    linear-gradient(rgba(217, 70, 239, 0.08) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(34, 211, 238, 0.07) 1px, transparent 1px);
+  background-size: 26px 26px;
+}
+
+.topbar {
+  background: linear-gradient(90deg, rgba(17, 7, 38, 0.82), rgba(20, 20, 43, 0.75));
+  backdrop-filter: blur(8px);
+}
+
+.glass {
+  background: rgba(17, 10, 34, 0.72);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(217, 70, 239, 0.25);
+  border-radius: 12px;
+}
+
+.panel-input {
+  background: rgba(7, 2, 20, 0.9);
+  border: 1px solid rgba(217, 70, 239, 0.35);
+  border-radius: 8px;
+  color: #f5f3ff;
+  padding: 0.6rem 0.75rem;
+  outline: none;
+}
+
+.panel-input:focus {
+  border-color: rgba(34, 211, 238, 0.8);
+  box-shadow: 0 0 0 2px rgba(34, 211, 238, 0.2);
+}
+
+.btn {
+  margin-top: 8px;
+  background: linear-gradient(90deg, var(--accent-a), #a855f7);
+  color: #0f0b1f;
+  padding: 8px 14px;
+  border-radius: 8px;
+  font-weight: 600;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.nav-item {
+  background: rgba(24, 15, 45, 0.55);
+  border: 1px solid rgba(34, 211, 238, 0.2);
+}
+
+.nav-item:hover {
+  border-color: rgba(217, 70, 239, 0.55);
+}
+
+.result-pre {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  overflow: auto;
+  background: rgba(7, 2, 20, 0.9);
+  border: 1px solid rgba(34, 211, 238, 0.28);
+  border-radius: 8px;
+  padding: 0.6rem;
+}
+
+.status-chip,
+.chip {
+  border: 1px solid rgba(217, 70, 239, 0.45);
+  background: rgba(217, 70, 239, 0.15);
+  color: #f5d0fe;
+  font-size: 11px;
+  border-radius: 9999px;
+  padding: 0.2rem 0.55rem;
+}
+
+.status-chip.idle {
+  border-color: rgba(34, 211, 238, 0.45);
+  background: rgba(34, 211, 238, 0.12);
+  color: #a5f3fc;
+}
+
+.metric-card {
+  border: 1px solid rgba(34, 211, 238, 0.25);
+  background: rgba(17, 10, 34, 0.6);
+  border-radius: 10px;
+  padding: 0.7rem 0.9rem;
+}
+
+.metric-card p {
+  color: #c4b5fd;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+}
+
+.metric-card strong {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 20px;
+}
