@@ -1,0 +1,42 @@
+openapi: 3.0.3
+info:
+  title: Elastic Agent Builder API
+  version: 0.1.0
+paths:
+  /health:
+    get:
+      responses: {'200': {description: ok}}
+  /metrics:
+    get:
+      responses: {'200': {description: prometheus}}
+  /api/indices:
+    get:
+      responses: {'200': {description: indices}}
+  /api/schema:
+    get:
+      parameters:
+        - in: query
+          name: pattern
+          schema: {type: string}
+      responses: {'200': {description: schema}}
+  /api/chat:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                message: {type: string}
+      responses: {'200': {description: chat result}}
+  /api/chat/stream:
+    post:
+      responses: {'200': {description: SSE stream}}
+  /api/conversations/{id}:
+    get:
+      parameters: [{in: path, name: id, required: true, schema: {type: string}}]
+      responses: {'200': {description: conversation}}
+  /api/audit:
+    get:
+      responses: {'200': {description: admin audit}}
