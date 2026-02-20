@@ -1,0 +1,8 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+body{font-family:Inter,system-ui,sans-serif;background:#020617;color:#e2e8f0}
+.bg-grid{background-image:linear-gradient(rgba(34,211,238,0.06) 1px,transparent 1px),linear-gradient(90deg,rgba(168,85,247,0.06) 1px,transparent 1px);background-size:24px 24px}
+.glass{background:rgba(15,23,42,.65);backdrop-filter:blur(6px);border:1px solid rgba(34,211,238,.2);border-radius:12px}
+.btn{margin-top:8px;background:#06b6d4;color:#020617;padding:6px 12px;border-radius:6px}
+pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;overflow:auto}
