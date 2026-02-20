@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.agent import NL2ESAgent
+from app.agent import NL2ESAgent, _trim_context, _sanitize_plan_fields
 
 
 class DummyLLM:
@@ -18,12 +18,22 @@ class DummyLLM:
 class DummyStore:
     def __init__(self):
         self._d = {}
+        self._m = {}
+        self.max_turns = 30
 
     def get(self, cid):
         return self._d.get(cid, [])
 
     def set(self, cid, msgs):
         self._d[cid] = msgs
+
+    def get_meta(self, cid):
+        return dict(self._m.get(cid, {}))
+
+    def update_meta(self, cid, **kwargs):
+        m = self._m.get(cid, {})
+        m.update(kwargs)
+        self._m[cid] = m
 
 
 class DummyTools:
@@ -79,6 +89,58 @@ class AccuracyFlowTests(unittest.IsolatedAsyncioTestCase):
         answer, warns = self.agent._verify_answer_against_artifact("No numbers here", {"count": 7})
         self.assertTrue(warns)
         self.assertIn("Verification notes", answer)
+
+    async def test_trim_context_respects_token_budget(self):
+        messages = [
+            {"role": "system", "content": "s" * 200},
+            {"role": "user", "content": "word " * 4000},
+            {"role": "assistant", "content": "word " * 4000},
+            {"role": "user", "content": "latest"},
+        ]
+        trimmed = _trim_context(messages, max_chars=200_000, max_tokens=250)
+        self.assertEqual(trimmed[0]["role"], "system")
+        self.assertEqual(trimmed[-1]["content"], "latest")
+        self.assertLess(len(trimmed), len(messages))
+
+    async def test_sanitize_plan_fields_drops_unknown_fields(self):
+        schema_small = {
+            "sample_fields": [{"field": "message"}, {"field": "host.name"}],
+            "date_fields": ["@timestamp"],
+            "preferred_time_field": "@timestamp",
+        }
+        plan = {
+            "pattern": "logs-*",
+            "mode": "aggregate",
+            "limit": 10,
+            "include_older_if_none": True,
+            "time": {"enabled": True, "field": "bad.time", "from": "now-1d", "to": "now"},
+            "filters": [
+                {"field": "message", "op": "match", "value": "error"},
+                {"field": "unknown.field", "op": "eq", "value": "x"},
+            ],
+            "group_by": "unknown.field",
+            "metric": {"fn": "count_distinct", "field": "unknown.field"},
+        }
+        out = _sanitize_plan_fields(plan, schema_small)
+        self.assertEqual(out["time"]["field"], "@timestamp")
+        self.assertEqual(len(out["filters"]), 1)
+        self.assertIsNone(out["group_by"])
+        self.assertIsNone(out["metric"]["field"])
+
+    async def test_compaction_builds_and_injects_memory_summary(self):
+        cid = "comp1"
+        msgs = [{"role": "system", "content": "base"}]
+        for i in range(30):
+            msgs.append({"role": "user", "content": ("user message " + str(i) + " ") * 150})
+            msgs.append({"role": "assistant", "content": ("assistant reply " + str(i) + " ") * 150})
+
+        compacted = self.agent._maybe_compact_messages(cid, msgs)
+        self.assertLess(len(compacted), len(msgs))
+        self.assertTrue(any((m.get("role") == "system" and "[Conversation memory]" in str(m.get("content") or "")) for m in compacted))
+
+        meta = self.agent.store.get_meta(cid)
+        self.assertTrue(meta.get("compacted"))
+        self.assertTrue(isinstance(meta.get("rolling_summary"), str) and len(meta.get("rolling_summary")) > 0)
 
 
 if __name__ == "__main__":
