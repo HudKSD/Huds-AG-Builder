@@ -3,6 +3,7 @@ import json
 import re
 from collections import Counter
 from typing import Any, Dict, List, Tuple, Optional
+from jsonschema import validate as js_validate, ValidationError
 
 from .llm_client import OpenAICompatibleClient, LLMError
 from .conversation_store import ConversationStore
@@ -94,6 +95,10 @@ Constraints:
 
 # ---- Context safety limits ----
 MAX_CONTEXT_CHARS = 180_000
+MAX_CONTEXT_TOKENS = 28_000
+COMPACTION_TRIGGER_TOKENS = 18_000
+COMPACTION_KEEP_TAIL_MESSAGES = 10
+MAX_ROLLING_SUMMARY_CHARS = 4_000
 MAX_TOOL_MESSAGE_CHARS = 12_000
 MAX_TABLE_ROWS_FOR_LLM = 30
 MAX_CELL_CHARS = 240
@@ -237,6 +242,26 @@ def _message_size(m: Dict[str, Any]) -> int:
     return len(s)
 
 
+def _estimate_tokens(text: str) -> int:
+    """
+    Lightweight token estimator without external tokenizer dependency.
+    """
+    if not text:
+        return 0
+    # Roughly splits into words/punctuation; tuned to avoid large underestimation.
+    parts = re.findall(r"\w+|[^\w\s]", text, flags=re.UNICODE)
+    return max(1, int(len(parts) * 1.1))
+
+
+def _message_tokens(m: Dict[str, Any]) -> int:
+    s = ""
+    if "content" in m and isinstance(m["content"], str):
+        s += m["content"]
+    if "tool_calls" in m:
+        s += json.dumps(m["tool_calls"], ensure_ascii=False)
+    return _estimate_tokens(s)
+
+
 def _chunk_for_tool_calls(rest: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
     blocks: List[List[Dict[str, Any]]] = []
     i = 0
@@ -268,7 +293,11 @@ def _repair_orphan_tool_messages(msgs: List[Dict[str, Any]]) -> List[Dict[str, A
     return out
 
 
-def _trim_context(messages: List[Dict[str, Any]], max_chars: int = MAX_CONTEXT_CHARS) -> List[Dict[str, Any]]:
+def _trim_context(
+    messages: List[Dict[str, Any]],
+    max_chars: int = MAX_CONTEXT_CHARS,
+    max_tokens: int = MAX_CONTEXT_TOKENS,
+) -> List[Dict[str, Any]]:
     if not messages:
         return messages
 
@@ -279,24 +308,32 @@ def _trim_context(messages: List[Dict[str, Any]], max_chars: int = MAX_CONTEXT_C
 
     kept_blocks: List[List[Dict[str, Any]]] = []
     total = _message_size(system) if system else 0
+    total_tokens = _message_tokens(system) if system else 0
 
     for block in reversed(blocks):
         block_size = sum(_message_size(m) for m in block)
-        if total + block_size > max_chars and kept_blocks:
+        block_tokens = sum(_message_tokens(m) for m in block)
+
+        over_chars = total + block_size > max_chars
+        over_tokens = total_tokens + block_tokens > max_tokens
+
+        if (over_chars or over_tokens) and kept_blocks:
             break
-        if total + block_size > max_chars and not kept_blocks:
+        if (over_chars or over_tokens) and not kept_blocks:
             clipped = []
             for mm in block:
                 m2 = dict(mm)
                 if isinstance(m2.get("content"), str):
-                    m2["content"] = _clip_text(m2["content"], max_chars // 6)
+                    m2["content"] = _clip_text(m2["content"], max_chars // 8)
                 clipped.append(m2)
             kept_blocks.append(clipped)
             total += sum(_message_size(m) for m in clipped)
+            total_tokens += sum(_message_tokens(m) for m in clipped)
             break
 
         kept_blocks.append(block)
         total += block_size
+        total_tokens += block_tokens
 
     kept_blocks.reverse()
     flattened: List[Dict[str, Any]] = []
@@ -305,6 +342,53 @@ def _trim_context(messages: List[Dict[str, Any]], max_chars: int = MAX_CONTEXT_C
 
     final_msgs = ([system] + flattened) if system else flattened
     return _repair_orphan_tool_messages(final_msgs)
+
+
+PLAN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "pattern": {"type": "string"},
+        "mode": {"type": "string", "enum": ["search", "aggregate"]},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+        "include_older_if_none": {"type": "boolean"},
+        "time": {
+            "type": "object",
+            "properties": {
+                "enabled": {"type": "boolean"},
+                "field": {"type": ["string", "null"]},
+                "from": {"type": "string"},
+                "to": {"type": "string"},
+            },
+            "additionalProperties": True,
+        },
+        "filters": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "field": {"type": "string"},
+                    "op": {"type": "string"},
+                    "value": {},
+                },
+                "required": ["field", "op"],
+                "additionalProperties": True,
+            },
+        },
+        "text_query": {"type": ["string", "null"]},
+        "group_by": {"type": ["string", "null"]},
+        "metric": {
+            "type": "object",
+            "properties": {
+                "fn": {"type": "string"},
+                "field": {"type": ["string", "null"]},
+            },
+            "required": ["fn"],
+            "additionalProperties": True,
+        },
+    },
+    "required": ["pattern", "mode", "limit", "time", "filters", "metric"],
+    "additionalProperties": True,
+}
 
 
 def _extract_tool_calls(msg: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -503,6 +587,51 @@ def _extract_esql_from_llm(text: str) -> str:
     return t.strip().strip('"').strip("'")
 
 
+def _sanitize_plan_fields(plan_obj: Dict[str, Any], schema_small: Dict[str, Any]) -> Dict[str, Any]:
+    allowed = set()
+    for key in ("sample_fields", "cve_fields", "message_fields", "date_fields", "actor_fields"):
+        vals = schema_small.get(key) or []
+        for v in vals:
+            if isinstance(v, dict):
+                f = v.get("field")
+                if isinstance(f, str) and f:
+                    allowed.add(f)
+            elif isinstance(v, str) and v:
+                allowed.add(v)
+
+    safe = dict(plan_obj)
+
+    time_cfg = safe.get("time")
+    if isinstance(time_cfg, dict):
+        tf = time_cfg.get("field")
+        if isinstance(tf, str) and tf and tf not in allowed:
+            time_cfg["field"] = schema_small.get("preferred_time_field") or None
+
+    filters = safe.get("filters")
+    if isinstance(filters, list):
+        out = []
+        for f in filters:
+            if not isinstance(f, dict):
+                continue
+            field = f.get("field")
+            op = f.get("op")
+            if isinstance(field, str) and isinstance(op, str) and field in allowed:
+                out.append(f)
+        safe["filters"] = out
+
+    group_by = safe.get("group_by")
+    if isinstance(group_by, str) and group_by and group_by not in allowed:
+        safe["group_by"] = None
+
+    metric = safe.get("metric")
+    if isinstance(metric, dict):
+        mf = metric.get("field")
+        if isinstance(mf, str) and mf and mf not in allowed:
+            metric["field"] = None
+
+    return safe
+
+
 async def _pick_time_field_by_probe(agent: "NL2ESAgent", index: str, candidates: List[str], gte: str, lte: str) -> Optional[str]:
     es = agent.tools.ctx.es
     for f in candidates[:12]:
@@ -694,6 +823,80 @@ class NL2ESAgent:
         self.max_steps = max_steps
         # lightweight session state for follow-ups (per conversation_id)
         self._state: Dict[str, Dict[str, Any]] = {}
+
+    def _store_get_meta(self, conversation_id: str) -> Dict[str, Any]:
+        getter = getattr(self.store, "get_meta", None)
+        if callable(getter):
+            out = getter(conversation_id)
+            return out if isinstance(out, dict) else {}
+        return {}
+
+    def _store_update_meta(self, conversation_id: str, **kwargs: Any) -> None:
+        updater = getattr(self.store, "update_meta", None)
+        if callable(updater):
+            updater(conversation_id, **kwargs)
+
+    def _memory_system_message(self, summary: str) -> Dict[str, Any]:
+        return {
+            "role": "system",
+            "content": "[Conversation memory]\n" + _clip_text(summary or "", MAX_ROLLING_SUMMARY_CHARS),
+        }
+
+    def _build_rolling_summary(self, previous_summary: str, messages: List[Dict[str, Any]]) -> str:
+        snippets: List[str] = []
+        for m in messages:
+            role = m.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            txt = str(m.get("content") or "").strip()
+            if not txt:
+                continue
+            txt = re.sub(r"\s+", " ", txt)
+            txt = _clip_text(txt, 220)
+            snippets.append(f"{role}: {txt}")
+
+        tail = snippets[-12:]
+        prefix = _clip_text((previous_summary or "").strip(), 2000)
+        if prefix:
+            merged = prefix + "\n" + "\n".join(tail)
+        else:
+            merged = "\n".join(tail)
+        return _clip_text(merged, MAX_ROLLING_SUMMARY_CHARS)
+
+    def _inject_memory_message(self, messages: List[Dict[str, Any]], summary: str) -> List[Dict[str, Any]]:
+        if not summary:
+            return messages
+        mem_msg = self._memory_system_message(summary)
+        out = [m for m in messages if not (m.get("role") == "system" and str(m.get("content") or "").startswith("[Conversation memory]"))]
+        if out and out[0].get("role") == "system":
+            return [out[0], mem_msg] + out[1:]
+        return [mem_msg] + out
+
+    def _maybe_compact_messages(self, conversation_id: str, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        total_tokens = sum(_message_tokens(m) for m in messages)
+        store_max_turns = int(getattr(self.store, "max_turns", 30) or 30)
+        if total_tokens < COMPACTION_TRIGGER_TOKENS and len(messages) < (store_max_turns * 2):
+            summary = self._store_get_meta(conversation_id).get("rolling_summary")
+            return self._inject_memory_message(messages, summary if isinstance(summary, str) else "")
+
+        head = messages[:1] if messages and messages[0].get("role") == "system" else []
+        body = messages[1:] if head else messages[:]
+        tail = body[-COMPACTION_KEEP_TAIL_MESSAGES:]
+        older = body[:-COMPACTION_KEEP_TAIL_MESSAGES]
+
+        prev_summary = self._store_get_meta(conversation_id).get("rolling_summary")
+        prev_summary = prev_summary if isinstance(prev_summary, str) else ""
+        new_summary = self._build_rolling_summary(prev_summary, older)
+        self._store_update_meta(
+            conversation_id,
+            rolling_summary=new_summary,
+            compacted=True,
+            compacted_message_count=len(older),
+        )
+
+        compacted = head + tail
+        compacted = self._inject_memory_message(compacted, new_summary)
+        return compacted
 
     def _state_get(self, conversation_id: str) -> Dict[str, Any]:
         return self._state.setdefault(conversation_id, {})
@@ -1290,6 +1493,13 @@ class NL2ESAgent:
         msg = (resp.get("choices") or [{}])[0].get("message") or {}
         plan_obj = _extract_json_object(msg.get("content") or "")
 
+        if isinstance(plan_obj, dict):
+            plan_obj = _sanitize_plan_fields(plan_obj, schema_small)
+            try:
+                js_validate(instance=plan_obj, schema=PLAN_SCHEMA)
+            except ValidationError:
+                plan_obj = None
+
         if not isinstance(plan_obj, dict):
             plan_obj = {
                 "pattern": pattern,
@@ -1836,6 +2046,7 @@ class NL2ESAgent:
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
         messages.append({"role": "user", "content": user_text})
+        messages = self._maybe_compact_messages(conversation_id, messages)
         messages = _trim_context(messages)
 
         trace: List[Dict[str, Any]] = []
