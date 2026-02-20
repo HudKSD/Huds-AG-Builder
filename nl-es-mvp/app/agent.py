@@ -3,6 +3,7 @@ import json
 import re
 from collections import Counter
 from typing import Any, Dict, List, Tuple, Optional
+from jsonschema import validate as js_validate, ValidationError
 
 from .llm_client import OpenAICompatibleClient, LLMError
 from .conversation_store import ConversationStore
@@ -94,6 +95,10 @@ Constraints:
 
 # ---- Context safety limits ----
 MAX_CONTEXT_CHARS = 180_000
+MAX_CONTEXT_TOKENS = 28_000
+COMPACTION_TRIGGER_TOKENS = 18_000
+COMPACTION_KEEP_TAIL_MESSAGES = 10
+MAX_ROLLING_SUMMARY_CHARS = 4_000
 MAX_TOOL_MESSAGE_CHARS = 12_000
 MAX_TABLE_ROWS_FOR_LLM = 30
 MAX_CELL_CHARS = 240
@@ -237,6 +242,26 @@ def _message_size(m: Dict[str, Any]) -> int:
     return len(s)
 
 
+def _estimate_tokens(text: str) -> int:
+    """
+    Lightweight token estimator without external tokenizer dependency.
+    """
+    if not text:
+        return 0
+    # Roughly splits into words/punctuation; tuned to avoid large underestimation.
+    parts = re.findall(r"\w+|[^\w\s]", text, flags=re.UNICODE)
+    return max(1, int(len(parts) * 1.1))
+
+
+def _message_tokens(m: Dict[str, Any]) -> int:
+    s = ""
+    if "content" in m and isinstance(m["content"], str):
+        s += m["content"]
+    if "tool_calls" in m:
+        s += json.dumps(m["tool_calls"], ensure_ascii=False)
+    return _estimate_tokens(s)
+
+
 def _chunk_for_tool_calls(rest: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
     blocks: List[List[Dict[str, Any]]] = []
     i = 0
@@ -268,7 +293,11 @@ def _repair_orphan_tool_messages(msgs: List[Dict[str, Any]]) -> List[Dict[str, A
     return out
 
 
-def _trim_context(messages: List[Dict[str, Any]], max_chars: int = MAX_CONTEXT_CHARS) -> List[Dict[str, Any]]:
+def _trim_context(
+    messages: List[Dict[str, Any]],
+    max_chars: int = MAX_CONTEXT_CHARS,
+    max_tokens: int = MAX_CONTEXT_TOKENS,
+) -> List[Dict[str, Any]]:
     if not messages:
         return messages
 
@@ -279,24 +308,32 @@ def _trim_context(messages: List[Dict[str, Any]], max_chars: int = MAX_CONTEXT_C
 
     kept_blocks: List[List[Dict[str, Any]]] = []
     total = _message_size(system) if system else 0
+    total_tokens = _message_tokens(system) if system else 0
 
     for block in reversed(blocks):
         block_size = sum(_message_size(m) for m in block)
-        if total + block_size > max_chars and kept_blocks:
+        block_tokens = sum(_message_tokens(m) for m in block)
+
+        over_chars = total + block_size > max_chars
+        over_tokens = total_tokens + block_tokens > max_tokens
+
+        if (over_chars or over_tokens) and kept_blocks:
             break
-        if total + block_size > max_chars and not kept_blocks:
+        if (over_chars or over_tokens) and not kept_blocks:
             clipped = []
             for mm in block:
                 m2 = dict(mm)
                 if isinstance(m2.get("content"), str):
-                    m2["content"] = _clip_text(m2["content"], max_chars // 6)
+                    m2["content"] = _clip_text(m2["content"], max_chars // 8)
                 clipped.append(m2)
             kept_blocks.append(clipped)
             total += sum(_message_size(m) for m in clipped)
+            total_tokens += sum(_message_tokens(m) for m in clipped)
             break
 
         kept_blocks.append(block)
         total += block_size
+        total_tokens += block_tokens
 
     kept_blocks.reverse()
     flattened: List[Dict[str, Any]] = []
@@ -305,6 +342,53 @@ def _trim_context(messages: List[Dict[str, Any]], max_chars: int = MAX_CONTEXT_C
 
     final_msgs = ([system] + flattened) if system else flattened
     return _repair_orphan_tool_messages(final_msgs)
+
+
+PLAN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "pattern": {"type": "string"},
+        "mode": {"type": "string", "enum": ["search", "aggregate"]},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+        "include_older_if_none": {"type": "boolean"},
+        "time": {
+            "type": "object",
+            "properties": {
+                "enabled": {"type": "boolean"},
+                "field": {"type": ["string", "null"]},
+                "from": {"type": "string"},
+                "to": {"type": "string"},
+            },
+            "additionalProperties": True,
+        },
+        "filters": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "field": {"type": "string"},
+                    "op": {"type": "string"},
+                    "value": {},
+                },
+                "required": ["field", "op"],
+                "additionalProperties": True,
+            },
+        },
+        "text_query": {"type": ["string", "null"]},
+        "group_by": {"type": ["string", "null"]},
+        "metric": {
+            "type": "object",
+            "properties": {
+                "fn": {"type": "string"},
+                "field": {"type": ["string", "null"]},
+            },
+            "required": ["fn"],
+            "additionalProperties": True,
+        },
+    },
+    "required": ["pattern", "mode", "limit", "time", "filters", "metric"],
+    "additionalProperties": True,
+}
 
 
 def _extract_tool_calls(msg: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -503,6 +587,51 @@ def _extract_esql_from_llm(text: str) -> str:
     return t.strip().strip('"').strip("'")
 
 
+def _sanitize_plan_fields(plan_obj: Dict[str, Any], schema_small: Dict[str, Any]) -> Dict[str, Any]:
+    allowed = set()
+    for key in ("sample_fields", "cve_fields", "message_fields", "date_fields", "actor_fields"):
+        vals = schema_small.get(key) or []
+        for v in vals:
+            if isinstance(v, dict):
+                f = v.get("field")
+                if isinstance(f, str) and f:
+                    allowed.add(f)
+            elif isinstance(v, str) and v:
+                allowed.add(v)
+
+    safe = dict(plan_obj)
+
+    time_cfg = safe.get("time")
+    if isinstance(time_cfg, dict):
+        tf = time_cfg.get("field")
+        if isinstance(tf, str) and tf and tf not in allowed:
+            time_cfg["field"] = schema_small.get("preferred_time_field") or None
+
+    filters = safe.get("filters")
+    if isinstance(filters, list):
+        out = []
+        for f in filters:
+            if not isinstance(f, dict):
+                continue
+            field = f.get("field")
+            op = f.get("op")
+            if isinstance(field, str) and isinstance(op, str) and field in allowed:
+                out.append(f)
+        safe["filters"] = out
+
+    group_by = safe.get("group_by")
+    if isinstance(group_by, str) and group_by and group_by not in allowed:
+        safe["group_by"] = None
+
+    metric = safe.get("metric")
+    if isinstance(metric, dict):
+        mf = metric.get("field")
+        if isinstance(mf, str) and mf and mf not in allowed:
+            metric["field"] = None
+
+    return safe
+
+
 async def _pick_time_field_by_probe(agent: "NL2ESAgent", index: str, candidates: List[str], gte: str, lte: str) -> Optional[str]:
     es = agent.tools.ctx.es
     for f in candidates[:12]:
@@ -596,6 +725,7 @@ def _detect_top_entity(text: str) -> Optional[str]:
 COUNT_RE = re.compile(r"\b(how\s*many|howmany|count|number\s+of|total)\b", re.IGNORECASE)
 FOLLOWUP_COUNT_RE = re.compile(r"^\s*(give\s+me\s+)?(the\s+)?count\s*$", re.IGNORECASE)
 HOWABOUT_RE = re.compile(r"^\s*(how\s+about|what\s+about)\b", re.IGNORECASE)
+TABLE_REQ_RE = re.compile(r"\b(table|tabular|matrix|columns?)\b", re.IGNORECASE)
 
 def _is_countish(text: str) -> bool:
     return bool(COUNT_RE.search(text)) or bool(FOLLOWUP_COUNT_RE.search(text))
@@ -621,6 +751,27 @@ def _detect_count_target(text: str) -> Optional[str]:
     if "event" in t or "document" in t or "doc" in t:
         return "documents"
     return None
+
+
+def _is_table_format_request(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    if "table" in t or "tabular" in t:
+        return True
+    if t in {"format as table", "put this in a table", "please create it in a table form"}:
+        return True
+    return bool(TABLE_REQ_RE.search(t) and len(t.split()) <= 12)
+
+
+def _looks_like_time_followup_only(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    if not _has_time_phrase(t):
+        return False
+    trigger = ["check", "search", "look", "past", "last", "in the"]
+    return len(t.split()) <= 12 and any(k in t for k in trigger)
 
 
 def _extract_index_hint(text: str) -> Optional[str]:
@@ -695,12 +846,149 @@ class NL2ESAgent:
         # lightweight session state for follow-ups (per conversation_id)
         self._state: Dict[str, Dict[str, Any]] = {}
 
+    def _store_get_meta(self, conversation_id: str) -> Dict[str, Any]:
+        getter = getattr(self.store, "get_meta", None)
+        if callable(getter):
+            out = getter(conversation_id)
+            return out if isinstance(out, dict) else {}
+        return {}
+
+    def _store_update_meta(self, conversation_id: str, **kwargs: Any) -> None:
+        updater = getattr(self.store, "update_meta", None)
+        if callable(updater):
+            updater(conversation_id, **kwargs)
+
+    def _memory_system_message(self, summary: str) -> Dict[str, Any]:
+        return {
+            "role": "system",
+            "content": "[Conversation memory]\n" + _clip_text(summary or "", MAX_ROLLING_SUMMARY_CHARS),
+        }
+
+    def _build_rolling_summary(self, previous_summary: str, messages: List[Dict[str, Any]]) -> str:
+        snippets: List[str] = []
+        for m in messages:
+            role = m.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            txt = str(m.get("content") or "").strip()
+            if not txt:
+                continue
+            txt = re.sub(r"\s+", " ", txt)
+            txt = _clip_text(txt, 220)
+            snippets.append(f"{role}: {txt}")
+
+        tail = snippets[-12:]
+        prefix = _clip_text((previous_summary or "").strip(), 2000)
+        if prefix:
+            merged = prefix + "\n" + "\n".join(tail)
+        else:
+            merged = "\n".join(tail)
+        return _clip_text(merged, MAX_ROLLING_SUMMARY_CHARS)
+
+    def _inject_memory_message(self, messages: List[Dict[str, Any]], summary: str) -> List[Dict[str, Any]]:
+        if not summary:
+            return messages
+        mem_msg = self._memory_system_message(summary)
+        out = [m for m in messages if not (m.get("role") == "system" and str(m.get("content") or "").startswith("[Conversation memory]"))]
+        if out and out[0].get("role") == "system":
+            return [out[0], mem_msg] + out[1:]
+        return [mem_msg] + out
+
+    def _maybe_compact_messages(self, conversation_id: str, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        total_tokens = sum(_message_tokens(m) for m in messages)
+        store_max_turns = int(getattr(self.store, "max_turns", 30) or 30)
+        if total_tokens < COMPACTION_TRIGGER_TOKENS and len(messages) < (store_max_turns * 2):
+            summary = self._store_get_meta(conversation_id).get("rolling_summary")
+            return self._inject_memory_message(messages, summary if isinstance(summary, str) else "")
+
+        head = messages[:1] if messages and messages[0].get("role") == "system" else []
+        body = messages[1:] if head else messages[:]
+        tail = body[-COMPACTION_KEEP_TAIL_MESSAGES:]
+        older = body[:-COMPACTION_KEEP_TAIL_MESSAGES]
+
+        prev_summary = self._store_get_meta(conversation_id).get("rolling_summary")
+        prev_summary = prev_summary if isinstance(prev_summary, str) else ""
+        new_summary = self._build_rolling_summary(prev_summary, older)
+        self._store_update_meta(
+            conversation_id,
+            rolling_summary=new_summary,
+            compacted=True,
+            compacted_message_count=len(older),
+        )
+
+        compacted = head + tail
+        compacted = self._inject_memory_message(compacted, new_summary)
+        return compacted
+
     def _state_get(self, conversation_id: str) -> Dict[str, Any]:
         return self._state.setdefault(conversation_id, {})
 
     def _state_update(self, conversation_id: str, **kwargs: Any) -> None:
         st = self._state_get(conversation_id)
         st.update(kwargs)
+
+    def _state_sanitize_for_followups(self, artifact: Dict[str, Any], conversation_id: str) -> None:
+        if not isinstance(artifact, dict):
+            return
+        count = artifact.get("count")
+        if isinstance(count, int) and count <= 0:
+            # Do not carry stale topic/entity hints if nothing matched.
+            self._state_update(
+                conversation_id,
+                last_topic=None,
+                last_count_target=None,
+                last_top_entity=None,
+                last_result_count=0,
+            )
+            return
+        if isinstance(count, int):
+            self._state_update(conversation_id, last_result_count=count)
+
+    def _table_from_hits(self, hits: List[Dict[str, Any]], max_rows: int = 12) -> str:
+        rows = []
+        for h in (hits or [])[:max_rows]:
+            src = h.get("_source") if isinstance(h, dict) else {}
+            if not isinstance(src, dict):
+                src = {}
+            ts = ""
+            for tf in ("@timestamp", "timestamp", "time", "date", "published", "created_at"):
+                if src.get(tf):
+                    ts = str(src.get(tf))
+                    break
+            actor = ""
+            for af in ("actor", "threat_actor", "threat.actor", "entities.actor", "adversary"):
+                if src.get(af):
+                    actor = str(src.get(af))
+                    break
+            summary = ""
+            for sf in ("summary", "description", "message", "title", "event.original"):
+                if src.get(sf):
+                    summary = str(src.get(sf))
+                    break
+
+            cves = src.get("entities.cves") or src.get("cve_id") or src.get("cves") or ""
+            if isinstance(cves, list):
+                cves = ", ".join(str(x) for x in cves[:4])
+            else:
+                cves = str(cves) if cves else ""
+
+            rows.append([
+                _clip_text(ts, 30) or "—",
+                _clip_text(actor, 40) or "—",
+                _clip_text(summary, 90) or "—",
+                _clip_text(cves, 60) or "—",
+            ])
+
+        if not rows:
+            return "No matching rows to render as a table."
+
+        out = [
+            "| Timestamp | Actor | Attack Summary | Related CVEs |",
+            "|---|---|---|---|",
+        ]
+        for r in rows:
+            out.append(f"| {r[0]} | {r[1]} | {r[2]} | {r[3]} |")
+        return "\n".join(out)
 
     async def _resolve_pattern_from_hint(self, hint: Optional[str]) -> Optional[str]:
         if not hint:
@@ -1290,6 +1578,13 @@ class NL2ESAgent:
         msg = (resp.get("choices") or [{}])[0].get("message") or {}
         plan_obj = _extract_json_object(msg.get("content") or "")
 
+        if isinstance(plan_obj, dict):
+            plan_obj = _sanitize_plan_fields(plan_obj, schema_small)
+            try:
+                js_validate(instance=plan_obj, schema=PLAN_SCHEMA)
+            except ValidationError:
+                plan_obj = None
+
         if not isinstance(plan_obj, dict):
             plan_obj = {
                 "pattern": pattern,
@@ -1835,7 +2130,36 @@ class NL2ESAgent:
         if not messages:
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
+        st = self._state_get(conversation_id)
+
+        # format-only follow-up: "please create it in a table form"
+        if _is_table_format_request(user_text):
+            last = st.get("last_artifact")
+            if isinstance(last, dict) and isinstance(last.get("hits"), list):
+                table = self._table_from_hits(last.get("hits") or [])
+                answer = "\n".join([
+                    table,
+                    "",
+                    "**Assumptions/filters**",
+                    f"- Engine: `{last.get('engine') or 'DSL'}`",
+                    f"- Time field: `{last.get('time_field_used') or '—'}`",
+                    f"- Time range: `{(last.get('time_range') or {}).get('from', '—')}` → `{(last.get('time_range') or {}).get('to', '—')}`",
+                    f"- Index pattern: `{last.get('index') or '—'}`",
+                    f"- Stage: `{last.get('stage') or '—'}`",
+                ])
+                messages.append({"role": "user", "content": user_text})
+                messages.append({"role": "assistant", "content": answer})
+                self.store.set(conversation_id, _trim_context(messages))
+                return answer, last, [{"step": "format_followup", "mode": "table"}]
+
+        # follow-up with only a new time window should keep the prior query intent
+        if _looks_like_time_followup_only(user_text):
+            prev_query = st.get("last_query_text")
+            if isinstance(prev_query, str) and prev_query.strip():
+                user_text = f"{prev_query.strip()} {user_text.strip()}"
+
         messages.append({"role": "user", "content": user_text})
+        messages = self._maybe_compact_messages(conversation_id, messages)
         messages = _trim_context(messages)
 
         trace: List[Dict[str, Any]] = []
@@ -1845,6 +2169,8 @@ class NL2ESAgent:
             messages.append({"role": "assistant", "content": idx_answer})
             messages = _trim_context(messages)
             self.store.set(conversation_id, messages)
+            self._state_update(conversation_id, last_artifact=idx_artifact, last_query_text=user_text)
+            self._state_sanitize_for_followups(idx_artifact, conversation_id)
             return idx_answer, idx_artifact, trace
 
         # Update topic/time state for follow-ups
@@ -1870,6 +2196,8 @@ class NL2ESAgent:
             messages.append({"role": "assistant", "content": count_answer})
             messages = _trim_context(messages)
             self.store.set(conversation_id, messages)
+            self._state_update(conversation_id, last_artifact=count_artifact, last_query_text=user_text)
+            self._state_sanitize_for_followups(count_artifact, conversation_id)
             return count_answer, count_artifact, trace
 
         # 3) deterministic top-N entities (DSL aggregations)
@@ -1883,6 +2211,8 @@ class NL2ESAgent:
             messages.append({"role": "assistant", "content": top_answer})
             messages = _trim_context(messages)
             self.store.set(conversation_id, messages)
+            self._state_update(conversation_id, last_artifact=top_artifact, last_query_text=user_text)
+            self._state_sanitize_for_followups(top_artifact, conversation_id)
             return top_answer, top_artifact, trace
 
         # 4) Router: ES|QL analytics vs DSL
@@ -1892,6 +2222,8 @@ class NL2ESAgent:
                 messages.append({"role": "assistant", "content": answer})
                 messages = _trim_context(messages)
                 self.store.set(conversation_id, messages)
+                self._state_update(conversation_id, last_artifact=artifact, last_query_text=user_text)
+                self._state_sanitize_for_followups(artifact, conversation_id)
                 return answer, artifact, trace
 
         trace.append({"step": "route", "engine": "dsl"})
@@ -1910,6 +2242,8 @@ class NL2ESAgent:
             messages = _trim_context(messages)
             self.store.set(conversation_id, messages)
             trace.append({"step": "execute", "stage": agg_artifact.get("stage"), "engine": "dsl"})
+            self._state_update(conversation_id, last_artifact=agg_artifact, last_query_text=user_text)
+            self._state_sanitize_for_followups(agg_artifact, conversation_id)
             return agg_answer, agg_artifact, trace
 
         # 7) DSL search mode with fallback ladder
@@ -1950,4 +2284,6 @@ class NL2ESAgent:
         messages = _trim_context(messages)
 
         self.store.set(conversation_id, messages)
+        self._state_update(conversation_id, last_artifact=artifact, last_query_text=user_text)
+        self._state_sanitize_for_followups(artifact, conversation_id)
         return answer, artifact, trace

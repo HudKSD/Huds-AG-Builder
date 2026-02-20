@@ -1,0 +1,40 @@
+{
+  "docs": [
+    {
+      "_index": "data_cached_2026.02.14",
+      "_id": "a1",
+      "_score": 1.0,
+      "_source": {
+        "@timestamp": "2026-02-14T09:10:00Z",
+        "message": "AI-enhanced phishing campaign targeting critical infrastructure and Active Directory-integrated systems.",
+        "summary": "AI-enhanced phishing and deepfake social engineering against enterprise identity platforms.",
+        "actor": "Unknown threat actor",
+        "entities.cves": ["CVE-2025-53770", "CVE-2025-49704"]
+      }
+    },
+    {
+      "_index": "data_cached_2026.02.12",
+      "_id": "a2",
+      "_score": 1.0,
+      "_source": {
+        "@timestamp": "2026-02-12T16:00:00Z",
+        "message": "Campaign exploited SharePoint chain and attempted AD lateral movement.",
+        "summary": "SharePoint RCE chain followed by Active Directory targeting.",
+        "actor": "UNC9999",
+        "entities.cves": ["CVE-2025-53771", "CVE-2025-49706"]
+      }
+    },
+    {
+      "_index": "data_cached_2025.11.01",
+      "_id": "u1",
+      "_score": 1.0,
+      "_source": {
+        "@timestamp": "2025-11-01T00:00:00Z",
+        "message": "UNC1069 activity observed in historical telemetry.",
+        "summary": "Historical UNC1069 beaconing and credential access.",
+        "actor": "UNC1069",
+        "entities.cves": ["CVE-2025-1111"]
+      }
+    }
+  ]
+}
