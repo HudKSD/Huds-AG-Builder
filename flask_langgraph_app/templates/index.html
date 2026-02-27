@@ -1,0 +1,46 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>NL Elasticsearch Chat</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+</head>
+<body>
+  <h1>Elasticsearch Chat + Process Viewer</h1>
+  <div class="layout">
+    <section>
+      <textarea id="message" placeholder="Ask a question..."></textarea>
+      <div class="controls">
+        <button id="run">Run</button>
+        <button id="dryRun">Dry run</button>
+      </div>
+      <div id="playbooks">
+        <button data-playbook="failed_logins">failed_logins</button>
+        <button data-playbook="top_source_ips_failed_logins">top_source_ips_failed_logins</button>
+      </div>
+      <h3>Context Variables (memory as constraints)</h3>
+      <label>Index <input id="selected_index"></label>
+      <label>Mode <select id="mode"><option>auto</option><option>esql</option><option>dsl</option></select></label>
+      <label>Time Range Hours <input id="time_range_hours" type="number" value="24"></label>
+      <label>Max Rows <input id="max_rows" type="number" value="200"></label>
+      <label>Baseline-first <input id="baseline_first" type="checkbox"></label>
+      <label>Baseline Window Hours <input id="baseline_window_hours" type="number" value="168"></label>
+    </section>
+    <section>
+      <h3>Timeline</h3>
+      <ul id="timeline"></ul>
+      <div id="blocked" class="hidden"></div>
+      <h3>Intent/Tool Transparency</h3>
+      <pre id="debug"></pre>
+      <h3>Query Diff + Why this query?</h3>
+      <pre id="queryDiff"></pre>
+      <h3>Evidence Cards</h3>
+      <div id="evidence"></div>
+      <h3>Schema Lens</h3>
+      <button id="loadFields">Load fields</button>
+      <ul id="fields"></ul>
+    </section>
+  </div>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

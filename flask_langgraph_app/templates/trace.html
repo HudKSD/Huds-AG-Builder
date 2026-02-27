@@ -1,0 +1,21 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Trace {{ trace.trace_id }}</title><link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}"></head>
+<body>
+<h1>Trace Explorer</h1>
+<p>Trace ID: {{ trace.trace_id }}</p>
+<h3>Node path</h3><pre>{{ node_path | tojson(indent=2) }}</pre>
+<h3>Node timings</h3><pre>{{ node_timings | tojson(indent=2) }}</pre>
+<h3>Tool trace</h3><pre>{{ tool_trace | tojson(indent=2) }}</pre>
+<h3>Validation</h3><pre>{{ validation | tojson(indent=2) }}</pre>
+<h3>Queries</h3><pre>{{ queries | tojson(indent=2) }}</pre>
+<h3>Evidence</h3><pre>{{ evidence | tojson(indent=2) }}</pre>
+<button onclick="replay('query_generate')">Replay from query_generate</button>
+<button onclick="replay('query_validate')">Replay from query_validate</button>
+<script>
+async function replay(from_node){
+ const r = await fetch('/replay/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({trace_id:'{{ trace.trace_id }}',from_node})});
+ const txt = await r.text();
+ alert('Replay events:\n'+txt.slice(0,1200));
+}
+</script>
+</body></html>

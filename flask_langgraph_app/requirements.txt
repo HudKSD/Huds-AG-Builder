@@ -1,0 +1,13 @@
+Flask==3.0.3
+gunicorn==22.0.0
+gevent==24.2.1
+python-dotenv==1.0.1
+openai==1.54.3
+elasticsearch==8.15.1
+pydantic==2.9.2
+langgraph==0.2.39
+langchain-core==0.3.12
+tenacity==9.0.0
+structlog==24.4.0
+pytest==8.3.3
+prometheus-client==0.21.0
