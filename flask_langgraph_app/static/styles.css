@@ -1,0 +1,8 @@
+body { font-family: Arial, sans-serif; margin: 20px; }
+.layout { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+textarea { width: 100%; height: 120px; }
+label { display:block; margin: 6px 0; }
+#timeline li { border-left: 4px solid #888; padding: 4px 8px; margin: 4px 0; }
+.hidden { display:none; }
+#blocked { background: #fee; border: 1px solid #c00; padding: 10px; margin: 10px 0; }
+pre { background:#f8f8f8; padding:10px; overflow:auto; }
