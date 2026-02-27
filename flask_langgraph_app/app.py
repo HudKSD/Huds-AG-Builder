@@ -108,7 +108,12 @@ def favicon():
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({
+        "status": "ok",
+        "service": "flask-langgraph-es-chat",
+        "storage": "sqlite",
+        "server_expected": "gunicorn+gevent",
+    })
 
 
 @app.get("/metrics")

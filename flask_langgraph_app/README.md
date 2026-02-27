@@ -4,34 +4,46 @@ Production-ready, self-hosted Flask + Jinja2 + vanilla JS app for natural-langua
 
 ## Run with Docker Compose
 
+### Option A (from app folder)
 ```bash
 cd flask_langgraph_app
 cp .env.example .env
 docker-compose up --build
 ```
 
+### Option B (from repository root)
+```bash
+cp flask_langgraph_app/.env.example flask_langgraph_app/.env
+docker-compose -f flask_langgraph_app/docker-compose.yml --env-file flask_langgraph_app/.env up --build
+```
+
 Open browser at `http://localhost:8000/`.
 
-Expected service list:
-- `app` only (this project uses SQLite by design).
+Expected containers/services for this app:
+- `flask-langgraph-es-chat-app` only.
+- No `postgres` / `redis` containers (this app uses SQLite).
 
-Expected app log line:
-- Gunicorn startup, **not** Hypercorn.
+Expected app server:
+- Gunicorn + gevent (not hypercorn).
 
 ## Troubleshooting (important)
 
-If you see services like `postgres`/`redis` or logs mentioning `hypercorn app.main`, you are running a different compose file from the repository root. Run compose from `flask_langgraph_app/` instead:
+If logs show `postgres-1`, `redis-1`, or `hypercorn app.main`, that is a different compose stack.
+Run this exact reset:
 
 ```bash
-cd flask_langgraph_app
-docker-compose down --remove-orphans
-docker-compose up --build
+# from repo root
+docker-compose down --remove-orphans || true
+docker-compose -f flask_langgraph_app/docker-compose.yml --env-file flask_langgraph_app/.env down --remove-orphans || true
+docker-compose -f flask_langgraph_app/docker-compose.yml --env-file flask_langgraph_app/.env up --build
 ```
 
-Quick checks:
+Runtime verification:
 
 ```bash
 curl -s http://localhost:8000/health
+# expected keys: service=flask-langgraph-es-chat, storage=sqlite, server_expected=gunicorn+gevent
+
 curl -s http://localhost:8000/metrics | head
 ```
 
