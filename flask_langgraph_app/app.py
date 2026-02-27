@@ -4,12 +4,14 @@ import json
 import os
 import queue
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
 from elasticsearch import Elasticsearch
 from flask import Flask, Response, jsonify, render_template, request
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 
 from graph import ChatGraph
 from planner import Planner
@@ -27,6 +29,10 @@ from validators import Constraints
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
+
+HTTP_REQUESTS = Counter("http_requests_total", "Total HTTP requests", ["method", "path", "status"])
+REQUEST_LATENCY = Histogram("http_request_duration_seconds", "HTTP request latency", ["method", "path"])
+CHAT_RUNS = Counter("chat_runs_total", "Total chat and dry-run executions", ["kind", "status"])
 
 
 def make_constraints() -> Constraints:
@@ -59,6 +65,21 @@ chat_graph = ChatGraph(planner, ESTools(es, constraints), constraints, os.getenv
 init_db()
 
 
+@app.before_request
+def _start_timer() -> None:
+    request._start_time = time.perf_counter()  # type: ignore[attr-defined]
+
+
+@app.after_request
+def _record_metrics(resp):
+    path = request.path if request.path.startswith("/") else "unknown"
+    HTTP_REQUESTS.labels(request.method, path, str(resp.status_code)).inc()
+    start = getattr(request, "_start_time", None)
+    if start is not None:
+        REQUEST_LATENCY.labels(request.method, path).observe(time.perf_counter() - start)
+    return resp
+
+
 def merged_preferences(conversation_id: str, body_preferences: dict[str, Any] | None) -> dict[str, Any]:
     stored = get_context_vars(conversation_id)
     prefs = {
@@ -80,9 +101,19 @@ def index():
     return render_template("index.html")
 
 
+@app.get("/favicon.ico")
+def favicon():
+    return Response(status=204)
+
+
 @app.get("/health")
 def health():
     return jsonify({"status": "ok"})
+
+
+@app.get("/metrics")
+def metrics():
+    return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
 
 
 @app.post("/chat")
@@ -93,6 +124,7 @@ def chat():
     save_message(cid, "user", body["message"])
     result = chat_graph.run(user_message=body["message"], conversation_id=cid, preferences=prefs)
     save_message(cid, "assistant", result["answer"])
+    CHAT_RUNS.labels("chat", "blocked" if result["blocked"] else "ok").inc()
     result["conversation_id"] = cid
     return jsonify(result)
 
@@ -112,6 +144,7 @@ def chat_stream():
     def worker():
         _, final = chat_graph.run(user_message=body["message"], conversation_id=cid, preferences=prefs, stream=True, emitter=emit)
         save_message(cid, "assistant", final["answer"])
+        CHAT_RUNS.labels("chat_stream", "blocked" if final["blocked"] else "ok").inc()
         final["conversation_id"] = cid
         q.put({"type": "final", **final})
         q.put(None)
@@ -134,6 +167,7 @@ def dry_run():
     cid = ensure_conversation(body.get("conversation_id"))
     prefs = merged_preferences(cid, body.get("preferences"))
     result = chat_graph.run(user_message=body["message"], conversation_id=cid, preferences=prefs, dry_run=True)
+    CHAT_RUNS.labels("dry_run", "blocked" if result["blocked"] else "ok").inc()
     return jsonify(result)
 
 
@@ -143,6 +177,7 @@ def dry_run_stream():
     cid = ensure_conversation(body.get("conversation_id"))
     prefs = merged_preferences(cid, body.get("preferences"))
     events, final = chat_graph.run(user_message=body["message"], conversation_id=cid, preferences=prefs, stream=True, dry_run=True)
+    CHAT_RUNS.labels("dry_run_stream", "blocked" if final["blocked"] else "ok").inc()
     return Response("".join(json.dumps(e) + "\n" for e in [*events, {"type": "final", **final}]), mimetype="application/x-ndjson")
 
 
@@ -170,6 +205,7 @@ def replay_stream():
             emitter=emit,
             dry_run=False,
         )
+        CHAT_RUNS.labels("replay_stream", "blocked" if final["blocked"] else "ok").inc()
         q.put({"type": "final", **final})
         q.put(None)
 
@@ -190,9 +226,20 @@ def trace_view(trace_id: str):
     tr = get_trace(trace_id)
     if not tr:
         return "Not found", 404
+
     def parse(v):
         return json.loads(v) if v else {}
-    return render_template("trace.html", trace=tr, node_path=parse(tr["node_path_json"]), node_timings=parse(tr["node_timings_json"]), tool_trace=parse(tr["tool_trace_json"]), queries=parse(tr["queries_json"]), validation=parse(tr["validation_json"]), evidence=parse(tr["evidence_json"]))
+
+    return render_template(
+        "trace.html",
+        trace=tr,
+        node_path=parse(tr["node_path_json"]),
+        node_timings=parse(tr["node_timings_json"]),
+        tool_trace=parse(tr["tool_trace_json"]),
+        queries=parse(tr["queries_json"]),
+        validation=parse(tr["validation_json"]),
+        evidence=parse(tr["evidence_json"]),
+    )
 
 
 @app.get("/export/<trace_id>.json")
@@ -211,7 +258,15 @@ def export_md(trace_id: str):
     cards = json.loads(tr["evidence_json"] or "[]")
     lines = ["# Evidence Cards"]
     for i, card in enumerate(cards, 1):
-        lines.extend([f"## Card {i}", f"- Claim: {card.get('claim')}", f"- Confidence: {card.get('confidence')}", f"- Metrics: {card.get('metrics')}", ""])
+        lines.extend(
+            [
+                f"## Card {i}",
+                f"- Claim: {card.get('claim')}",
+                f"- Confidence: {card.get('confidence')}",
+                f"- Metrics: {card.get('metrics')}",
+                "",
+            ]
+        )
     return Response("\n".join(lines), mimetype="text/markdown")
 
 
