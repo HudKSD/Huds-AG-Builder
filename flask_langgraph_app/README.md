@@ -25,6 +25,7 @@ Expected containers/services for this app:
 
 Expected app server:
 - Gunicorn + gevent (not hypercorn).
+- Container logs should include: `[flask-langgraph-es-chat] Starting Gunicorn with gevent worker`.
 
 ## Troubleshooting (important)
 
@@ -45,6 +46,7 @@ curl -s http://localhost:8000/health
 # expected keys: service=flask-langgraph-es-chat, storage=sqlite, server_expected=gunicorn+gevent
 
 curl -s http://localhost:8000/metrics | head
+docker-compose logs app | grep -E "Gunicorn|hypercorn"
 ```
 
 ## Streaming behavior

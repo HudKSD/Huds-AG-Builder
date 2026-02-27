@@ -8,4 +8,4 @@ COPY . .
 RUN chown -R appuser:appuser /app
 USER appuser
 EXPOSE 8000
-CMD ["gunicorn", "-k", "gevent", "-w", "1", "-b", "0.0.0.0:8000", "app:app"]
+ENTRYPOINT ["/app/entrypoint.sh"]
